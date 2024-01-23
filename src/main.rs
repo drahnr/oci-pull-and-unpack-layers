@@ -1,7 +1,5 @@
 mod util;
-use color_eyre::eyre::Context;
 use fs::os::unix::fs::FileExt;
-use util::*;
 mod errors;
 use errors::*;
 use fs_err as fs;
@@ -130,7 +128,7 @@ impl Houdini {
 
         gum::debug!(target: LOG_TARGET, "manifest for {image_uri}: {manifest:?}");
 
-        let dest = std::path::PathBuf::from("/home/bernhard/.foo/").join("unpack");
+        let dest = std::path::PathBuf::from(dirs::home_dir().unwrap()).join("unpack");
         let _ = fs_err::remove_dir_all(&dest);
         fs_err::create_dir_all(&dest)?;
 
@@ -153,7 +151,7 @@ impl Houdini {
                             return false;
                         };
                         use sha2::Digest;
-                        let mut buf = [0; 1 << 12];
+                        let mut buf = [0; 1 << 16];
                         let mut acc = 0;
                         while let Ok(n) = data.read(&mut buf[..]) {
                             if n == 0 {
@@ -163,9 +161,12 @@ impl Houdini {
                             gum::info!("Read total of {acc} byte");
                             digest.input(&buf[..n]);
                         }
-                        digest.result().to_vec()
+                        dbg!(digest.result()).to_vec()
                     }
-                } == layer.digest.as_bytes()
+                } == dbg!(const_hex::decode(
+                    &layer.digest.split(":").skip(1).next().unwrap()
+                ))
+                .unwrap()
             }) {
                 // TODO check matching sha256
                 gum::debug!(target: LOG_TARGET, "Layer blob already exists on disk, skipping download");
@@ -180,37 +181,39 @@ impl Houdini {
                     .pull_blob(&reference, &layer.digest, &mut blob_file)
                     .await?;
                 gum::debug!(target: LOG_TARGET, "Downloaded layer blob for {image_uri}");
+            }
 
-                let blob = fs_err::read(&layer_blob_path)?; // bonkers
-                let mut blob = &blob[..];
+            gum::info!(target: LOG_TARGET, "Loading blob for {} from {}", &image_uri, layer_blob_path.display());
 
-                fn unpack<T: std::io::Read>(
-                    arch: &mut tar::Archive<T>,
-                    dest: &std::path::Path,
-                ) -> std::io::Result<()> {
-                    arch.set_unpack_xattrs(true);
-                    arch.set_overwrite(true);
-                    arch.set_preserve_mtime(false);
-                    arch.set_preserve_permissions(false);
-                    arch.set_preserve_ownerships(false);
-                    arch.unpack(&dest)?;
-                    Ok(())
+            let blob = fs_err::read(&layer_blob_path)?; // bonkers
+            let mut blob = &blob[..];
+
+            fn unpack<T: std::io::Read>(
+                arch: &mut tar::Archive<T>,
+                dest: &std::path::Path,
+            ) -> std::io::Result<()> {
+                arch.set_unpack_xattrs(false);
+                arch.set_overwrite(true);
+                arch.set_preserve_mtime(false);
+                arch.set_preserve_permissions(false);
+                arch.set_preserve_ownerships(false);
+                arch.unpack(&dest)?;
+                Ok(())
+            }
+            // unpacking to target dir
+            match dbg!(layer.media_type.as_str()) {
+                // FIXME verify these are identicaly for sure
+                IMAGE_LAYER_MEDIA_TYPE | IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE => {
+                    let mut arch = tar::Archive::new(&mut blob);
+                    unpack(&mut arch, &dest)?;
                 }
-                // unpacking to target dir
-                match dbg!(layer.media_type.as_str()) {
-                    // FIXME verify these are identicaly for sure
-                    IMAGE_LAYER_MEDIA_TYPE | IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE => {
-                        let mut arch = tar::Archive::new(&mut blob);
-                        unpack(&mut arch, &dest)?;
-                    }
-                    IMAGE_LAYER_GZIP_MEDIA_TYPE | IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE => {
-                        let mut buf = flate2::read::GzDecoder::new(&mut blob);
-                        let mut arch = tar::Archive::new(&mut buf);
-                        unpack(&mut arch, &dest)?;
-                    }
-                    _ => {
-                        todo!()
-                    }
+                IMAGE_LAYER_GZIP_MEDIA_TYPE | IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE => {
+                    let mut buf = flate2::read::GzDecoder::new(&mut blob);
+                    let mut arch = tar::Archive::new(&mut buf);
+                    unpack(&mut arch, &dest)?;
+                }
+                _ => {
+                    todo!()
                 }
             }
         }
