@@ -17,7 +17,7 @@ use oci_spec::{
     image::{Arch, ImageConfigurationBuilder},
     runtime::{LinuxNamespace, Spec},
 };
-use std::{os::unix::fs::chroot, path::PathBuf};
+use std::{os::unix::fs::{chown, chroot, PermissionsExt}, path::PathBuf};
 
 const LOG_TARGET: &str = "foo";
 use std::str::FromStr;
@@ -192,8 +192,12 @@ impl Houdini {
                 arch: &mut tar::Archive<T>,
                 dest: &std::path::Path,
             ) -> std::io::Result<()> {
+                let mut metadata = dest.metadata()?;
+                metadata.permissions().set_mode(0o777);
+                
                 arch.set_unpack_xattrs(true);
                 arch.set_overwrite(true);
+                arch.set_mask(0o022);
                 arch.set_preserve_mtime(false);
                 arch.set_preserve_permissions(true);
                 arch.set_preserve_ownerships(false);
@@ -228,14 +232,18 @@ impl Houdini {
 async fn main() -> color_eyre::eyre::Result<()> {
     color_eyre::install()?;
     pretty_env_logger::formatted_timed_builder()
-        .filter_level(gum::LevelFilter::Trace)
+        .filter_level(gum::LevelFilter::Debug)
         .init();
     let houdini = Houdini {
         extract_base: PathBuf::from("/tmp/oci/extract_base"),
         image_dir: PathBuf::from("/tmp/oci/tar_folder"),
     };
+    let ubuntu = "docker.io/library/ubuntu:latest";
+    let fedora = "registry.fedoraproject.org/fedora:latest";
+    let quay = "quay.io/drahnr/rust-glibc-builder";
+    let busybox = "docker.io/library/busybox:latest";
     houdini
-        .run("docker.io/library/ubuntu:latest")
+        .run(fedora)
         .await?;
     Ok(())
 }
