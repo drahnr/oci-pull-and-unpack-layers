@@ -192,10 +192,10 @@ impl Houdini {
                 arch: &mut tar::Archive<T>,
                 dest: &std::path::Path,
             ) -> std::io::Result<()> {
-                arch.set_unpack_xattrs(false);
+                arch.set_unpack_xattrs(true);
                 arch.set_overwrite(true);
                 arch.set_preserve_mtime(false);
-                arch.set_preserve_permissions(false);
+                arch.set_preserve_permissions(true);
                 arch.set_preserve_ownerships(false);
                 arch.unpack(&dest)?;
                 Ok(())
@@ -235,7 +235,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
         image_dir: PathBuf::from("/tmp/oci/tar_folder"),
     };
     houdini
-        .run("registry.fedoraproject.org/fedora:latest")
+        .run("docker.io/library/ubuntu:latest")
         .await?;
     Ok(())
 }
