@@ -1,14 +1,27 @@
 mod util;
 use color_eyre::eyre::Context;
+use fs::os::unix::fs::FileExt;
 use util::*;
 mod errors;
 use errors::*;
-use oci_registry_client::manifest::Digest;
-
 use fs_err as fs;
+use libcontainer::{
+    container::{builder::ContainerBuilder, ContainerStatus},
+    rootfs::Device,
+    syscall::syscall::SyscallType,
+};
+use oci_distribution::manifest::OciManifest;
+use oci_distribution::manifest::{
+    IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
+    IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
+};
+use oci_spec::{
+    image::{Arch, ImageConfigurationBuilder},
+    runtime::{LinuxNamespace, Spec},
+};
+use std::{os::unix::fs::chroot, path::PathBuf};
 
 const LOG_TARGET: &str = "foo";
-use std::path::PathBuf;
 use std::str::FromStr;
 
 use std::io::{Read, Write};
@@ -90,93 +103,117 @@ impl Houdini {
         self.image_dir.join("manifests")
     }
 
-    fn run(&self) -> color_eyre::eyre::Result<()> {
-        let image_uri = "fedora:latest";
-        // let image_id = ImageId::from_str(image_uri)?;
-
-        gum::info!(target: LOG_TARGET, "Requesting from registry");
-        let registry = oci_registry_client::DockerRegistryClientV2::new(
-            "registry.fedoraproject.org",
-            "https://registry.fedoraproject.org",
-            "https://registry.fedoraproject.org",
-        );
-        let rt = tokio::runtime::Runtime::new()?;
-
+    async fn run(&self, image_uri: &'static str) -> color_eyre::eyre::Result<()> {
         gum::info!(target: LOG_TARGET, "Setting up dirs");
 
         let layer_blob_dir = self.blob_store_dir();
         let manifest_dir = self.manifest_store_dir();
 
-        let layer_digests = rt.block_on(async move {
+        fs::create_dir_all(&layer_blob_dir)?;
+        let manifest_dir = manifest_dir.join("fedora-shuold-be-image-id"); // bonkers
+        fs::create_dir_all(&manifest_dir)?;
+        let manifest_path = manifest_dir.join("manifest.json");
 
-            gum::info!(target: LOG_TARGET, "Fetch fedora latest");
-            let manifest = registry.manifest("fedora", "latest").await?;
-            gum::debug!(target: LOG_TARGET, "manifest for {image_uri}: {manifest:?}");
+        let cfg = oci_distribution::client::ClientConfig {
+            protocol: oci_distribution::client::ClientProtocol::Https,
+            ..Default::default()
+        };
 
-            fs::create_dir_all(&layer_blob_dir)?;
-            let manifest_dir = manifest_dir.join("fedora-shuold-be-image-id"); // bonkers
-            fs::create_dir_all(&manifest_dir)?;
-            let manifest_path = manifest_dir.join("manifest.json");
+        let mut registry_client = oci_distribution::Client::new(cfg);
+        let auth = oci_distribution::secrets::RegistryAuth::Anonymous;
 
-            for (i, layer) in manifest.layers.iter().enumerate() {
-                gum::trace!(target: LOG_TARGET, "Layer: {idx}, {layer}", idx=i, layer=&layer.digest.hash);
-                let layer_blob_path = layer_blob_dir.join(&layer.digest.hash);
-                // TODO use filelock here, to avoid accidental concurrency fuckups
+        let reference: oci_distribution::Reference = image_uri.parse()?;
 
-                if let Ok(true) = fs_err::metadata(&layer_blob_path)
-                .map(|metadata| { dbg!(metadata.is_file()) && dbg!(!metadata.is_symlink()) && {
-                    let mut digest = <sha2::Sha256 as sha2::digest::Digest>::new();
-                    if let Ok(mut data) = fs_err::File::open(&layer_blob_path) {
+        let (manifest, _) = registry_client
+            .pull_image_manifest(&reference, &auth)
+            .await?;
+
+        gum::debug!(target: LOG_TARGET, "manifest for {image_uri}: {manifest:?}");
+
+        let dest = std::path::PathBuf::from("/home/bernhard/.foo/").join("unpack");
+        let _ = fs_err::remove_dir_all(&dest);
+        fs_err::create_dir_all(&dest)?;
+
+        for (idx, layer) in manifest.layers.iter().enumerate() {
+            gum::info!(
+                "Working on layer#{idx}: {digest}",
+                idx = idx,
+                digest = &layer.digest
+            );
+            let layer_blob_path =
+                layer_blob_dir.join(&layer.digest.split(":").skip(1).next().unwrap());
+            // fs_err::create_dir_all(&layer_blob_path)?;
+            // TODO use filelock here, to avoid accidental concurrency fuckups
+
+            if let Ok(true) = tokio::fs::metadata(&layer_blob_path).await.map(|x| {
+                x.is_file() && !x.is_symlink() && {
+                    {
+                        let mut digest = <sha2::Sha256 as sha2::digest::Digest>::new();
+                        let Ok(mut data) = fs_err::File::open(&layer_blob_path) else {
+                            return false;
+                        };
                         use sha2::Digest;
-                        let mut buf = [0u8; 8192];
-                        gum::warn!(target: LOG_TARGET, "Hashing...");
+                        let mut buf = [0; 1 << 12];
+                        let mut acc = 0;
                         while let Ok(n) = data.read(&mut buf[..]) {
+                            if n == 0 {
+                                break;
+                            }
+                            acc += n;
+                            gum::info!("Read total of {acc} byte");
                             digest.input(&buf[..n]);
                         }
-                        gum::warn!(target: LOG_TARGET, "Hash calc complete");
-
-                        let eval = layer.digest == oci_registry_client::manifest::Digest::from_sha256(digest.result());
-                        gum::warn!(target: LOG_TARGET, "Hashes matchin? {eval}");
-                        return dbg!(eval)
-                        } else {
-                            gum::warn!(target: LOG_TARGET, "File exists, but couldn't read it {layer_blob_path:?}");
-                        return dbg!(false)
+                        digest.result().to_vec()
                     }
-                } })
-                {
-                    // TODO check matching sha256
-                    gum::debug!(target: LOG_TARGET, "Layer blob already exists on disk, skipping download");
-                } else {
-                    gum::warn!(target: LOG_TARGET, "Downloading layer blob...");
+                } == layer.digest.as_bytes()
+            }) {
+                // TODO check matching sha256
+                gum::debug!(target: LOG_TARGET, "Layer blob already exists on disk, skipping download");
+            } else {
+                let mut blob_file = fs_err::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&layer_blob_path)?;
+                let mut blob_file = tokio::fs::File::from_std(blob_file.into());
+                registry_client
+                    .pull_blob(&reference, &layer.digest, &mut blob_file)
+                    .await?;
+                gum::debug!(target: LOG_TARGET, "Downloaded layer blob for {image_uri}");
 
-                    fs::create_dir_all(layer_blob_path.parent().expect("Must have a parent. qed"))?;
-                    let mut out_file = fs::OpenOptions::new()
-                        .create(true)
-                        .truncate(true)
-                        .write(true)
-                        .open(layer_blob_path)?;
-                    gum::debug!(target: LOG_TARGET, "Sending req to registry, out file ready for input");
-                    let mut blob = registry.blob(image_uri, &layer.digest).await.wrap_err("Blob retrieve")?;
-                    gum::debug!(target: LOG_TARGET, "Got response for blob");
+                let blob = fs_err::read(&layer_blob_path)?; // bonkers
+                let mut blob = &blob[..];
 
-                    let mut acc = 0;
-                    while let Some(chunk) = blob.chunk().await.wrap_err("Chunk retrieve failed")? {
-                        acc += chunk.len();
-                        gum::debug!(target: LOG_TARGET, "Received bytes (total: {acc})");
-                        out_file.write_all(&chunk)?;
+                fn unpack<T: std::io::Read>(
+                    arch: &mut tar::Archive<T>,
+                    dest: &std::path::Path,
+                ) -> std::io::Result<()> {
+                    arch.set_unpack_xattrs(true);
+                    arch.set_overwrite(true);
+                    arch.set_preserve_mtime(false);
+                    arch.set_preserve_permissions(false);
+                    arch.set_preserve_ownerships(false);
+                    arch.unpack(&dest)?;
+                    Ok(())
+                }
+                // unpacking to target dir
+                match dbg!(layer.media_type.as_str()) {
+                    // FIXME verify these are identicaly for sure
+                    IMAGE_LAYER_MEDIA_TYPE | IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE => {
+                        let mut arch = tar::Archive::new(&mut blob);
+                        unpack(&mut arch, &dest)?;
                     }
-                    gum::debug!(target: LOG_TARGET, "Downloaded layer {i} blob for {image_uri}");
+                    IMAGE_LAYER_GZIP_MEDIA_TYPE | IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE => {
+                        let mut buf = flate2::read::GzDecoder::new(&mut blob);
+                        let mut arch = tar::Archive::new(&mut buf);
+                        unpack(&mut arch, &dest)?;
+                    }
+                    _ => {
+                        todo!()
+                    }
                 }
             }
-            gum::trace!(target: LOG_TARGET, "Downloaded all layers");
-            Ok::<_, color_eyre::eyre::ErrReport>(Vec::from_iter(manifest.layers.iter().map(|x| x.digest.hash.clone())))
-        })?;
-
-        gum::error!(target: LOG_TARGET, "Now what?");
-
-        let _rootfs_desc = oci_spec::image::RootFsBuilder::default()
-            .diff_ids(layer_digests)
-            .build()?;
+        }
 
         gum::error!(target: LOG_TARGET, "Now what!?");
 
@@ -184,7 +221,8 @@ impl Houdini {
     }
 }
 
-fn main() -> color_eyre::eyre::Result<()> {
+#[tokio::main]
+async fn main() -> color_eyre::eyre::Result<()> {
     color_eyre::install()?;
     pretty_env_logger::formatted_timed_builder()
         .filter_level(gum::LevelFilter::Trace)
@@ -193,6 +231,8 @@ fn main() -> color_eyre::eyre::Result<()> {
         extract_base: PathBuf::from("/tmp/oci/extract_base"),
         image_dir: PathBuf::from("/tmp/oci/tar_folder"),
     };
-    houdini.run()?;
+    houdini
+        .run("registry.fedoraproject.org/fedora:latest")
+        .await?;
     Ok(())
 }

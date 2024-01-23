@@ -10,10 +10,14 @@ thiserror = { version = "*" }
 gum = { package = "log", version = "*" }
 regex = "1"
 once_cell = "1"
-oci-registry-client = "0.2.1"
 oci-spec = "0.6"
 libcontainer = "0.3.1"
-tokio = { version = "1", features = ["fs", "io-util", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = [
+  "fs",
+  "io-util",
+  "rt-multi-thread",
+  "time",
+] }
 fs-err = { version = "*" }
 sha2 = { version = "=0.8.2" }
 uuid = { version = "1", features = ["v4"] }
@@ -22,3 +26,4 @@ tar = "*"
 tempfile = "*"
 color-eyre = "*"
 pretty_env_logger = "*"
+oci-distribution = "*"

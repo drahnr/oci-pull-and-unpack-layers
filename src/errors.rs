@@ -65,5 +65,5 @@ pub enum Error {
     OciSpec(#[from] oci_spec::OciSpecError),
 
     #[error(transparent)]
-    RegistryResponse(#[from] oci_registry_client::errors::ErrorResponse),
+    RegistryResponse(#[from] oci_distribution::errors::OciDistributionError),
 }
