@@ -348,7 +348,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
     let fedora = "registry.fedoraproject.org/fedora:latest";
     let quay = "quay.io/drahnr/rust-glibc-builder";
     let busybox = "docker.io/library/busybox:latest";
-    houdini.run(fedora).await?;
+    houdini.run(quay).await?;
     Ok(())
 }
 
