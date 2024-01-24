@@ -23,6 +23,7 @@ use oci_spec::{
 };
 use std::{
     fs::Permissions,
+    io::{Cursor, Seek, SeekFrom},
     os::unix::fs::{chown, chroot, MetadataExt, PermissionsExt},
     path::PathBuf,
 };
@@ -89,37 +90,110 @@ impl FromStr for ImageId {
 }
 
 fn unpack<T: std::io::Read + std::io::Seek>(
-    arch: &mut tar::Archive<T>,
-    dest: &std::path::Path,
+    mut arch: tar::Archive<T>,
+    blob_src: &std::path::Path,
+    unpack_dest: &std::path::Path,
 ) -> std::io::Result<()> {
-    let mut metadata = dest.metadata()?;
+    // without it, `motd.d` won't unpack successfully
+    let mut metadata = unpack_dest.metadata()?;
     metadata.permissions().set_mode(0o777);
 
+    gum::warn!(target: LOG_TARGET, "Unpacking (tar-rs) layer {} to: {}", blob_src.display(), unpack_dest.display());
     arch.set_unpack_xattrs(true);
     arch.set_overwrite(true);
     arch.set_mask(0o022);
     arch.set_preserve_mtime(false);
     arch.set_preserve_permissions(true);
     arch.set_preserve_ownerships(false);
-    arch.unpack(&dest)?;
+    // arch.unpack(unpack_dest)?;
+    // return Ok(());
+
+    for entry in arch.entries()? {
+        let mut entry = entry?;
+        let in_tar_relative_path = entry.path()?.to_path_buf();
+        let in_tar_relative_path = PathBuf::from_iter(in_tar_relative_path.components().skip(1));
+        let unpack_file_dest = unpack_dest.join(&in_tar_relative_path);
+
+        fs_err::create_dir_all(unpack_file_dest.parent().unwrap())?;
+        match dbg!(entry.header().entry_type()) {
+            tar::EntryType::Directory => {
+                fs_err::create_dir_all(unpack_file_dest)?;
+            }
+            tar::EntryType::Regular => {
+                let mut dest_f = fs_err::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(unpack_file_dest)?;
+                std::io::copy(&mut entry, &mut dest_f)?;
+            }
+            _ => {}
+        }
+    }
+
+    let mut inner = arch.into_inner();
+    inner.seek(SeekFrom::Start(0))?;
+    let mut arch = tar::Archive::new(inner);
+    for entry in arch.entries()? {
+        let mut entry = entry?;
+        let in_tar_relative_path = entry.path()?.to_path_buf();
+        let in_tar_relative_path = PathBuf::from_iter(in_tar_relative_path.components().skip(1));
+        let unpack_file_dest = unpack_dest.join(&in_tar_relative_path);
+        gum::info!(target: LOG_TARGET, "Unpacking {} to {}", in_tar_relative_path.display(), unpack_file_dest.display());
+
+        fs_err::create_dir_all(unpack_file_dest.parent().unwrap())?;
+        match dbg!(entry.header().entry_type()) {
+            tar::EntryType::Link => {
+                let link_to_create = entry.link_name()?.unwrap().to_path_buf();
+                let _ = fs_err::hard_link(link_to_create, unpack_file_dest);
+            }
+            tar::EntryType::Symlink => {
+                let link_to_create = entry.link_name()?.unwrap().to_path_buf();
+                let _ = fs_err::soft_link(link_to_create, unpack_file_dest);
+            }
+            tar::EntryType::Directory | tar::EntryType::Regular => { /* already handled */ }
+            et => {
+                gum::info!(target: LOG_TARGET, "{:?}, unhandled, skipping..", et);
+            }
+        }
+    }
+    let mut inner = arch.into_inner();
+    inner.seek(SeekFrom::Start(0))?;
+    let mut arch = tar::Archive::new(inner);
+    for entry in arch.entries()? {
+        let mut entry = entry?;
+        let in_tar_relative_path = entry.path()?.to_path_buf();
+        let in_tar_relative_path = PathBuf::from_iter(in_tar_relative_path.components().skip(1));
+        let unpack_file_dest = unpack_dest.join(&in_tar_relative_path);
+
+        // TODO preserve permissions
+    }
+
+    // TODO fixup permissions in a 3rd loop
     Ok(())
 }
 fn unpack_akv(
     arch: &mut akv::reader::ArchiveReader<'_>,
+    blob_src: &std::path::Path,
     unpack_dest: &std::path::Path,
 ) -> std::io::Result<()> {
-    gum::warn!(target: LOG_TARGET, "Unpacking layer to: {}", unpack_dest.display());
+    gum::warn!(target: LOG_TARGET, "Unpacking (akv) layer {} to: {}", blob_src.display(), unpack_dest.display());
+
     while let Some(entry) = arch.next_entry()? {
         let in_tar_relative_path = entry.pathname_utf8()?;
         let unpack_file_dest = unpack_dest.join(in_tar_relative_path);
         gum::info!(target: LOG_TARGET, "Unpacking {} to {}", in_tar_relative_path, unpack_file_dest.display());
         let mut entry_reader = entry.into_reader();
-        let mut dest_f = fs_err::OpenOptions::new()
+        if let Ok(mut dest_f) = fs_err::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(unpack_file_dest)?;
-        std::io::copy(&mut entry_reader, &mut dest_f)?;
+            .open(&unpack_file_dest)
+        {
+            std::io::copy(&mut entry_reader, &mut dest_f)?;
+        } else {
+            gum::warn!(target: LOG_TARGET, "Failed to write to {}", unpack_file_dest.display());
+        }
     }
     Ok(())
 }
@@ -133,8 +207,10 @@ pub struct Houdini {
 }
 
 impl Houdini {
-    fn rootfs_dir(&self, image_id: &ImageId) -> PathBuf {
-        self.extract_base.join(image_id.as_str()).join("rootfs")
+    fn rootfs_dir(&self, image_id: &uuid::Uuid) -> PathBuf {
+        self.extract_base
+            .join(image_id.as_hyphenated().to_string())
+            .join("rootfs")
     }
 
     fn blob_store_dir(&self) -> PathBuf {
@@ -180,10 +256,7 @@ impl Houdini {
         manifest_f.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;
         gum::info!(target: LOG_TARGET, "Wrote manifest content to {}", manifest_path.display());
 
-        let unpack_dest = self
-            .extract_base
-            .join(uuid.as_hyphenated().to_string())
-            .join("rootfs");
+        let unpack_dest = self.rootfs_dir(&uuid);
         let _ = fs_err::remove_dir_all(&unpack_dest);
         fs_err::create_dir_all(&unpack_dest)?;
 
@@ -208,7 +281,7 @@ impl Houdini {
                             return false;
                         };
                         use sha2::Digest;
-                        let mut buf = [0; 1 << 16];
+                        let mut buf = [0; 1 << 20];
                         let mut acc = 0;
                         while let Ok(n) = data.read(&mut buf[..]) {
                             if n == 0 {
@@ -251,22 +324,23 @@ impl Houdini {
                 // FIXME verify these are identicaly for sure
                 IMAGE_LAYER_MEDIA_TYPE | IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE => {
                     let mut arch = tar::Archive::new(&mut blob);
-                    unpack(&mut arch, &unpack_dest)?;
+                    unpack(arch, &layer_blob_path, &unpack_dest)?;
                     continue;
-                    let mut arch = akv::reader::ArchiveReader::open_io(&mut blob)?;
-                    unpack_akv(&mut arch, &unpack_dest)?;
+                    // let mut arch = akv::reader::ArchiveReader::open_io(&mut blob)?;
+                    // unpack_akv(&mut arch, &layer_blob_path,  &unpack_dest)?;
                 }
                 IMAGE_LAYER_GZIP_MEDIA_TYPE | IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE => {
                     let mut gzdecoder = flate2::read::GzDecoder::new(&mut blob);
                     let mut decompressed =
                         tempfile::tempfile_in(layer_blob_path.parent().unwrap())?;
                     std::io::copy(&mut gzdecoder, &mut decompressed)?;
+                    decompressed.seek(std::io::SeekFrom::Start(0))?;
                     // `tar-rs` fails with hardlinks and some permissions, `libarchive` works just fine.
-                    let mut arch = tar::Archive::new(&mut decompressed);
-                    unpack(&mut arch, &unpack_dest)?;
+                    let mut arch = tar::Archive::new(decompressed);
+                    unpack(arch, &layer_blob_path, &unpack_dest)?;
                     continue;
-                    let mut arch = akv::reader::ArchiveReader::open_io(&mut decompressed)?;
-                    unpack_akv(&mut arch, &unpack_dest)?;
+                    // let mut arch = akv::reader::ArchiveReader::open_io(&mut decompressed)?;
+                    // unpack_akv(&mut arch, &layer_blob_path, &unpack_dest)?;
                 }
                 _ => {
                     todo!()
@@ -311,7 +385,7 @@ impl Houdini {
             let mut process = oci_spec::runtime::Process::default();
             process
                 .set_env(Some(vec![
-                    "PATH=/usr/local/bin:/usr/bin:/sbin:/bin".to_owned()
+                    "PATH=/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/bin".to_owned(),
                 ]))
                 .set_cwd(PathBuf::from("/"))
                 .set_args(Some(Vec::from_iter(
