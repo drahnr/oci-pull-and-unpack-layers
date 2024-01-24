@@ -185,10 +185,9 @@ impl Houdini {
 
             gum::info!(target: LOG_TARGET, "Loading blob for {} from {}", &image_uri, layer_blob_path.display());
 
-            let blob = fs_err::read(&layer_blob_path)?; // bonkers
-            let mut blob = &blob[..];
+            let mut blob = fs_err::OpenOptions::new().read(true).open(&layer_blob_path)?; // bonkers
 
-            fn unpack<T: std::io::Read>(
+            fn unpack<T: std::io::Read + std::io::Seek>(
                 arch: &mut tar::Archive<T>,
                 dest: &std::path::Path,
             ) -> std::io::Result<()> {
@@ -204,17 +203,35 @@ impl Houdini {
                 arch.unpack(&dest)?;
                 Ok(())
             }
+            fn unpack_akv(arch: &mut akv::reader::ArchiveReader<'_>, dest: &std::path::Path) -> std::io::Result<()>{
+                while let Some(entry) = arch.next_entry()? {
+                    let in_tar_relative_path = entry.pathname_utf8()?;
+                    let unpack_file_dest = dest.join(in_tar_relative_path);
+                    gum::debug!(target: LOG_TARGET, "Unpacking {} to {}", in_tar_relative_path, unpack_file_dest.display());
+                    let mut entry_reader = entry.into_reader();
+                    let mut dest_f = fs_err::OpenOptions::new().create(true).write(true).truncate(true).open(unpack_file_dest)?;
+                    std::io::copy(&mut entry_reader, &mut dest_f)?;
+                }
+                Ok(())
+            }
             // unpacking to target dir
             match dbg!(layer.media_type.as_str()) {
                 // FIXME verify these are identicaly for sure
                 IMAGE_LAYER_MEDIA_TYPE | IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE => {
-                    let mut arch = tar::Archive::new(&mut blob);
-                    unpack(&mut arch, &dest)?;
+                    let mut arch = akv::reader::ArchiveReader::open_io(&mut blob)?;
+                    // let mut arch = tar::Archive::new(&mut blob);
+                    // unpack(&mut arch, &dest)?;
+                    unpack_akv(&mut arch, &dest)?;
                 }
                 IMAGE_LAYER_GZIP_MEDIA_TYPE | IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE => {
-                    let mut buf = flate2::read::GzDecoder::new(&mut blob);
-                    let mut arch = tar::Archive::new(&mut buf);
-                    unpack(&mut arch, &dest)?;
+                    // let mut blob = flate2::read::GzDecoder::new(&mut blob);
+                    // let mut arch = tar::Archive::new(&mut blob);
+                    // unpack(&mut arch, &dest)?;
+                    let mut gzblob = flate2::read::GzDecoder::new(&mut blob);
+                    let mut decompressed = tempfile::tempfile()?;
+                    std::io::copy(&mut gzblob, &mut decompressed)?;
+                    let mut arch = akv::reader::ArchiveReader::open_io(&mut decompressed)?;
+                    unpack_akv(&mut arch, &dest)?;
                 }
                 _ => {
                     todo!()
