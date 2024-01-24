@@ -16,10 +16,14 @@ use oci_distribution::manifest::{
 };
 use oci_spec::{
     image::{Arch, ImageConfigurationBuilder},
-    runtime::{Capability, Linux, LinuxNamespace, Mount, ProcessBuilder, Root, RootBuilder, Spec},
+    runtime::{
+        Capability, Linux, LinuxCapabilities, LinuxCapabilitiesBuilder, LinuxNamespace, Mount,
+        ProcessBuilder, Root, RootBuilder, Spec,
+    },
 };
 use std::{
-    os::unix::fs::{chown, chroot, PermissionsExt},
+    fs::Permissions,
+    os::unix::fs::{chown, chroot, MetadataExt, PermissionsExt},
     path::PathBuf,
 };
 
@@ -84,6 +88,42 @@ impl FromStr for ImageId {
     }
 }
 
+fn unpack<T: std::io::Read + std::io::Seek>(
+    arch: &mut tar::Archive<T>,
+    dest: &std::path::Path,
+) -> std::io::Result<()> {
+    let mut metadata = dest.metadata()?;
+    metadata.permissions().set_mode(0o777);
+
+    arch.set_unpack_xattrs(true);
+    arch.set_overwrite(true);
+    arch.set_mask(0o022);
+    arch.set_preserve_mtime(false);
+    arch.set_preserve_permissions(true);
+    arch.set_preserve_ownerships(false);
+    arch.unpack(&dest)?;
+    Ok(())
+}
+fn unpack_akv(
+    arch: &mut akv::reader::ArchiveReader<'_>,
+    unpack_dest: &std::path::Path,
+) -> std::io::Result<()> {
+    gum::warn!(target: LOG_TARGET, "Unpacking layer to: {}", unpack_dest.display());
+    while let Some(entry) = arch.next_entry()? {
+        let in_tar_relative_path = entry.pathname_utf8()?;
+        let unpack_file_dest = unpack_dest.join(in_tar_relative_path);
+        gum::info!(target: LOG_TARGET, "Unpacking {} to {}", in_tar_relative_path, unpack_file_dest.display());
+        let mut entry_reader = entry.into_reader();
+        let mut dest_f = fs_err::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(unpack_file_dest)?;
+        std::io::copy(&mut entry_reader, &mut dest_f)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 pub struct Houdini {
     /// The folder where to place the downloaded `tar.gz`.
@@ -107,6 +147,7 @@ impl Houdini {
 
     async fn run(&self, image_uri: &'static str) -> color_eyre::eyre::Result<()> {
         gum::info!(target: LOG_TARGET, "Setting up dirs");
+        let uuid = uuid::Uuid::new_v4();
 
         let layer_blob_dir = self.blob_store_dir();
         let manifest_dir = self.manifest_store_dir();
@@ -136,12 +177,17 @@ impl Houdini {
             .create(true)
             .truncate(true)
             .open(&manifest_path)?;
-        manifest_f.write_all(serde_json::to_string(&manifest)?.as_bytes())?;
+        manifest_f.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;
         gum::info!(target: LOG_TARGET, "Wrote manifest content to {}", manifest_path.display());
 
-        let dest = std::path::PathBuf::from(dirs::home_dir().unwrap()).join("unpack");
-        let _ = fs_err::remove_dir_all(&dest);
-        fs_err::create_dir_all(&dest)?;
+        let unpack_dest = self
+            .extract_base
+            .join(uuid.as_hyphenated().to_string())
+            .join("rootfs");
+        let _ = fs_err::remove_dir_all(&unpack_dest);
+        fs_err::create_dir_all(&unpack_dest)?;
+
+        gum::info!(target: LOG_TARGET, "Unpacking into rootfs: {}", unpack_dest.display());
 
         for (idx, layer) in manifest.layers.iter().enumerate() {
             gum::info!(
@@ -154,8 +200,8 @@ impl Houdini {
             // fs_err::create_dir_all(&layer_blob_path)?;
             // TODO use filelock here, to avoid accidental concurrency fuckups
 
-            if let Ok(true) = tokio::fs::metadata(&layer_blob_path).await.map(|x| {
-                x.is_file() && !x.is_symlink() && {
+            if let Ok(true) = tokio::fs::metadata(&layer_blob_path).await.map(|metadata| {
+                dbg!(metadata.size()) > 4096 && metadata.is_file() && !metadata.is_symlink() && {
                     {
                         let mut digest = <sha2::Sha256 as sha2::digest::Digest>::new();
                         let Ok(mut data) = fs_err::File::open(&layer_blob_path) else {
@@ -172,15 +218,15 @@ impl Houdini {
                             gum::trace!("Read total of {acc} byte");
                             digest.input(&buf[..n]);
                         }
-                        digest.result().to_vec()
+                        let digest = digest.result().to_vec();
+                        dbg!(const_hex::encode(&digest[..]));
+                        digest
                     }
-                } == const_hex::decode(
-                    &layer.digest.split(":").skip(1).next().unwrap(),
-                )
-                .unwrap()
+                }
+                    == const_hex::decode(dbg!(&layer.digest.split(":").skip(1).next().unwrap()))
+                        .unwrap()
             }) {
-                // TODO check matching sha256
-                gum::debug!(target: LOG_TARGET, "Layer blob already exists on disk, skipping download");
+                gum::info!(target: LOG_TARGET, "Layer blob already exists on disk {}, skipping download", layer_blob_path.display());
             } else {
                 let mut blob_file = fs_err::OpenOptions::new()
                     .create(true)
@@ -191,7 +237,7 @@ impl Houdini {
                 registry_client
                     .pull_blob(&reference, &layer.digest, &mut blob_file)
                     .await?;
-                gum::debug!(target: LOG_TARGET, "Downloaded layer blob for {image_uri}");
+                gum::info!(target: LOG_TARGET, "Downloaded layer blob for {image_uri}");
             }
 
             gum::info!(target: LOG_TARGET, "Loading blob for {} from {}", &image_uri, layer_blob_path.display());
@@ -200,68 +246,36 @@ impl Houdini {
                 .read(true)
                 .open(&layer_blob_path)?; // bonkers
 
-            fn unpack<T: std::io::Read + std::io::Seek>(
-                arch: &mut tar::Archive<T>,
-                dest: &std::path::Path,
-            ) -> std::io::Result<()> {
-                let mut metadata = dest.metadata()?;
-                metadata.permissions().set_mode(0o777);
-
-                arch.set_unpack_xattrs(true);
-                arch.set_overwrite(true);
-                arch.set_mask(0o022);
-                arch.set_preserve_mtime(false);
-                arch.set_preserve_permissions(true);
-                arch.set_preserve_ownerships(false);
-                arch.unpack(&dest)?;
-                Ok(())
-            }
-            fn unpack_akv(
-                arch: &mut akv::reader::ArchiveReader<'_>,
-                dest: &std::path::Path,
-            ) -> std::io::Result<()> {
-                while let Some(entry) = arch.next_entry()? {
-                    let in_tar_relative_path = entry.pathname_utf8()?;
-                    let unpack_file_dest = dest.join(in_tar_relative_path);
-                    gum::debug!(target: LOG_TARGET, "Unpacking {} to {}", in_tar_relative_path, unpack_file_dest.display());
-                    let mut entry_reader = entry.into_reader();
-                    let mut dest_f = fs_err::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(unpack_file_dest)?;
-                    std::io::copy(&mut entry_reader, &mut dest_f)?;
-                }
-                Ok(())
-            }
             // unpacking to target dir
             match dbg!(layer.media_type.as_str()) {
                 // FIXME verify these are identicaly for sure
                 IMAGE_LAYER_MEDIA_TYPE | IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE => {
+                    let mut arch = tar::Archive::new(&mut blob);
+                    unpack(&mut arch, &unpack_dest)?;
+                    continue;
                     let mut arch = akv::reader::ArchiveReader::open_io(&mut blob)?;
-                    // let mut arch = tar::Archive::new(&mut blob);
-                    // unpack(&mut arch, &dest)?;
-                    unpack_akv(&mut arch, &dest)?;
+                    unpack_akv(&mut arch, &unpack_dest)?;
                 }
                 IMAGE_LAYER_GZIP_MEDIA_TYPE | IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE => {
-                    // `tar-rs` fails with hardlinks and some permissions, `libarchive` works just fine.
-                    // let mut blob = flate2::read::GzDecoder::new(&mut blob);
-                    // let mut arch = tar::Archive::new(&mut blob);
-                    // unpack(&mut arch, &dest)?;
-                    let mut gzblob = flate2::read::GzDecoder::new(&mut blob);
+                    let mut gzdecoder = flate2::read::GzDecoder::new(&mut blob);
                     let mut decompressed =
                         tempfile::tempfile_in(layer_blob_path.parent().unwrap())?;
-                    std::io::copy(&mut gzblob, &mut decompressed)?;
+                    std::io::copy(&mut gzdecoder, &mut decompressed)?;
+                    // `tar-rs` fails with hardlinks and some permissions, `libarchive` works just fine.
+                    let mut arch = tar::Archive::new(&mut decompressed);
+                    unpack(&mut arch, &unpack_dest)?;
+                    continue;
                     let mut arch = akv::reader::ArchiveReader::open_io(&mut decompressed)?;
-                    unpack_akv(&mut arch, &dest)?;
+                    unpack_akv(&mut arch, &unpack_dest)?;
                 }
                 _ => {
                     todo!()
                 }
             }
         }
+        gum::info!(target: LOG_TARGET, "Starting boundaries setup");
 
-        self.execution(dest.as_path())?;
+        self.execution(uuid, unpack_dest.as_path())?;
         gum::error!(target: LOG_TARGET, "Now what!?");
 
         Ok(())
@@ -269,46 +283,86 @@ impl Houdini {
 
     fn execution(
         &self,
+        container_id: uuid::Uuid,
         unpacked_container_contents: &std::path::Path,
     ) -> color_eyre::eyre::Result<()> {
         let root_dir = unpacked_container_contents;
+        let bundle_dir = root_dir.parent().unwrap();
+
         assert!(fs_err::metadata(&root_dir)?.is_dir());
 
-        if false {
-            let mut rootfs = libcontainer::rootfs::RootFS::new();
+        if true {
+            // create /dev in case it doesn't exist yet, it likely won't
+            let _ = fs_err::create_dir(dbg!(root_dir.join("dev")));
+            fs_err::set_permissions(root_dir.join("dev"), Permissions::from_mode(0o777_u32))?; // otherwise we can't symlink /proc/kcore to /dev/kcore in the intermediate process
+            let _ = fs_err::create_dir(dbg!(root_dir.join("proc")));
+            fs_err::set_permissions(root_dir.join("proc"), Permissions::from_mode(0o777_u32))?;
 
-            let mut spec = Spec::default(); // load(self.manifest_store_dir().join("manifest.json"))?;
-            let mut linux = Linux::default();
+            let caps = LinuxCapabilities::default();
+            // .ambient(Capability::SysAdmin)
+            // .inheritable(Capability::SysAdmin)
+            // .effective(Capability::SysAdmin).build()?;
+
+            let mut spec = Spec::default(); // load(self.manifest_store_dir().join("config.json"))?;
+            let mut root = RootBuilder::default();
+            let mut linux = Linux::rootless(1000, 1000);
             linux.set_rootfs_propagation(Some("shared".to_owned()));
-            let mut root = RootBuilder::default()
-                .readonly(true)
+
+            let mut process = oci_spec::runtime::Process::default();
+            process
+                .set_env(Some(vec![
+                    "PATH=/usr/local/bin:/usr/bin:/sbin:/bin".to_owned()
+                ]))
+                .set_cwd(PathBuf::from("/"))
+                .set_args(Some(Vec::from_iter(
+                    ["bash", "-c", "ls", "-al"]
+                        .into_iter()
+                        .map(|x| x.to_owned()),
+                )))
+                .set_capabilities(Some(caps))
+                .set_no_new_privileges(Some(true));
+
+            let root = RootBuilder::default()
                 .path(&root_dir)
+                .readonly(false)
                 .build()?;
             spec.set_linux(Some(linux))
-                .set_mounts(None)
+                .set_mounts(Some(vec![]))
                 .set_hostname("trapped".to_owned().into())
                 .set_root(Some(root))
                 .set_hooks(None)
                 .set_annotations(None)
-                .set_domainname(Some("gensyn.ai".to_owned()));
+                .set_domainname(Some("gensyn.ai".to_owned()))
+                .set_process(Some(process));
             gum::info!(target: LOG_TARGET, "Spec {spec:?}");
-            rootfs.prepare_rootfs(&spec, &root_dir, true, false)?;
 
-            // let mut process = ProcessBuilder::default();
-            // process.capabilities(Capability::SysAdmin).no_new_privileges(true).cwd(&root_dir).env(None).command_line(value)
+            // not sure this is required?
+            // if it's enabled, get duplicate symlink errors
+            // let mut rootfs = libcontainer::rootfs::RootFS::new();
+            // rootfs.prepare_rootfs(&spec, &root_dir, true, true)?;
 
-            let uuid = uuid::Uuid::new_v4();
-            let mut container =
-                ContainerBuilder::new(uuid.as_hyphenated().to_string(), SyscallType::default());
-            let container = container
+            let config_json = serde_json::to_string_pretty(&spec).unwrap();
+            fs_err::write(bundle_dir.join("config.json"), config_json.as_bytes()).unwrap();
+
+            let mut container = ContainerBuilder::new(
+                container_id.as_hyphenated().to_string(),
+                SyscallType::default(),
+            );
+            let mut container = container
                 .with_executor(DefaultExecutor {})
                 .with_root_path(&root_dir)?
-                .as_init("/tmp/oci/exec")
+                .validate_id()?
+                .as_init(&bundle_dir)
                 .with_detach(false)
                 .with_systemd(false)
                 .build()?;
+            container.start().or_else(|e| {
+                let _ = dbg!(container.delete(true));
+                Err(e)
+            })?;
+            container.delete(true)?;
         } else {
-            let command_as_string = "cat /etc/os-release";
+            let command_as_string = "ls -al";
             gum::info!(target: LOG_TARGET, "Attempting to run `sh -c {}` in {}", command_as_string, root_dir.display());
             let mut command = std::process::Command::new("sh");
             command.arg("-c");
@@ -341,14 +395,20 @@ async fn main() -> color_eyre::eyre::Result<()> {
         .filter_level(gum::LevelFilter::Debug)
         .init();
     let houdini = Houdini {
-        extract_base: PathBuf::from("/tmp/oci/extract_base"),
-        image_dir: PathBuf::from("/tmp/oci/tar_folder"),
+        extract_base: dirs::home_dir()
+            .unwrap()
+            .join("oci-overlayer")
+            .join("containers"),
+        image_dir: dirs::home_dir()
+            .unwrap()
+            .join("oci-overlayer")
+            .join("blobs"),
     };
     let ubuntu = "docker.io/library/ubuntu:latest";
     let fedora = "registry.fedoraproject.org/fedora:latest";
     let quay = "quay.io/drahnr/rust-glibc-builder";
     let busybox = "docker.io/library/busybox:latest";
-    houdini.run(quay).await?;
+    houdini.run(fedora).await?;
     Ok(())
 }
 
