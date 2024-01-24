@@ -1399,6 +1399,7 @@ dependencies = [
  "once_cell",
  "pretty_env_logger",
  "regex",
+ "serde_json",
  "sha2 0.8.2",
  "tar",
  "tempfile",

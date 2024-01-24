@@ -7,6 +7,7 @@ use libcontainer::{
     container::{builder::ContainerBuilder, ContainerStatus},
     rootfs::Device,
     syscall::syscall::SyscallType,
+    workload::default::DefaultExecutor,
 };
 use oci_distribution::manifest::OciManifest;
 use oci_distribution::manifest::{
@@ -15,9 +16,12 @@ use oci_distribution::manifest::{
 };
 use oci_spec::{
     image::{Arch, ImageConfigurationBuilder},
-    runtime::{LinuxNamespace, Spec},
+    runtime::{Capability, Linux, LinuxNamespace, Mount, ProcessBuilder, Root, RootBuilder, Spec},
 };
-use std::{os::unix::fs::{chown, chroot, PermissionsExt}, path::PathBuf};
+use std::{
+    os::unix::fs::{chown, chroot, PermissionsExt},
+    path::PathBuf,
+};
 
 const LOG_TARGET: &str = "foo";
 use std::str::FromStr;
@@ -127,6 +131,13 @@ impl Houdini {
             .await?;
 
         gum::debug!(target: LOG_TARGET, "manifest for {image_uri}: {manifest:?}");
+        let mut manifest_f = fs_err::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&manifest_path)?;
+        manifest_f.write_all(serde_json::to_string(&manifest)?.as_bytes())?;
+        gum::info!(target: LOG_TARGET, "Wrote manifest content to {}", manifest_path.display());
 
         let dest = std::path::PathBuf::from(dirs::home_dir().unwrap()).join("unpack");
         let _ = fs_err::remove_dir_all(&dest);
@@ -158,14 +169,14 @@ impl Houdini {
                                 break;
                             }
                             acc += n;
-                            gum::info!("Read total of {acc} byte");
+                            gum::trace!("Read total of {acc} byte");
                             digest.input(&buf[..n]);
                         }
-                        dbg!(digest.result()).to_vec()
+                        digest.result().to_vec()
                     }
-                } == dbg!(const_hex::decode(
-                    &layer.digest.split(":").skip(1).next().unwrap()
-                ))
+                } == const_hex::decode(
+                    &layer.digest.split(":").skip(1).next().unwrap(),
+                )
                 .unwrap()
             }) {
                 // TODO check matching sha256
@@ -185,7 +196,9 @@ impl Houdini {
 
             gum::info!(target: LOG_TARGET, "Loading blob for {} from {}", &image_uri, layer_blob_path.display());
 
-            let mut blob = fs_err::OpenOptions::new().read(true).open(&layer_blob_path)?; // bonkers
+            let mut blob = fs_err::OpenOptions::new()
+                .read(true)
+                .open(&layer_blob_path)?; // bonkers
 
             fn unpack<T: std::io::Read + std::io::Seek>(
                 arch: &mut tar::Archive<T>,
@@ -193,7 +206,7 @@ impl Houdini {
             ) -> std::io::Result<()> {
                 let mut metadata = dest.metadata()?;
                 metadata.permissions().set_mode(0o777);
-                
+
                 arch.set_unpack_xattrs(true);
                 arch.set_overwrite(true);
                 arch.set_mask(0o022);
@@ -203,13 +216,20 @@ impl Houdini {
                 arch.unpack(&dest)?;
                 Ok(())
             }
-            fn unpack_akv(arch: &mut akv::reader::ArchiveReader<'_>, dest: &std::path::Path) -> std::io::Result<()>{
+            fn unpack_akv(
+                arch: &mut akv::reader::ArchiveReader<'_>,
+                dest: &std::path::Path,
+            ) -> std::io::Result<()> {
                 while let Some(entry) = arch.next_entry()? {
                     let in_tar_relative_path = entry.pathname_utf8()?;
                     let unpack_file_dest = dest.join(in_tar_relative_path);
                     gum::debug!(target: LOG_TARGET, "Unpacking {} to {}", in_tar_relative_path, unpack_file_dest.display());
                     let mut entry_reader = entry.into_reader();
-                    let mut dest_f = fs_err::OpenOptions::new().create(true).write(true).truncate(true).open(unpack_file_dest)?;
+                    let mut dest_f = fs_err::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(unpack_file_dest)?;
                     std::io::copy(&mut entry_reader, &mut dest_f)?;
                 }
                 Ok(())
@@ -224,11 +244,13 @@ impl Houdini {
                     unpack_akv(&mut arch, &dest)?;
                 }
                 IMAGE_LAYER_GZIP_MEDIA_TYPE | IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE => {
+                    // `tar-rs` fails with hardlinks and some permissions, `libarchive` works just fine.
                     // let mut blob = flate2::read::GzDecoder::new(&mut blob);
                     // let mut arch = tar::Archive::new(&mut blob);
                     // unpack(&mut arch, &dest)?;
                     let mut gzblob = flate2::read::GzDecoder::new(&mut blob);
-                    let mut decompressed = tempfile::tempfile()?;
+                    let mut decompressed =
+                        tempfile::tempfile_in(layer_blob_path.parent().unwrap())?;
                     std::io::copy(&mut gzblob, &mut decompressed)?;
                     let mut arch = akv::reader::ArchiveReader::open_io(&mut decompressed)?;
                     unpack_akv(&mut arch, &dest)?;
@@ -239,8 +261,75 @@ impl Houdini {
             }
         }
 
+        self.execution(dest.as_path())?;
         gum::error!(target: LOG_TARGET, "Now what!?");
 
+        Ok(())
+    }
+
+    fn execution(
+        &self,
+        unpacked_container_contents: &std::path::Path,
+    ) -> color_eyre::eyre::Result<()> {
+        let root_dir = unpacked_container_contents;
+        assert!(fs_err::metadata(&root_dir)?.is_dir());
+
+        if false {
+            let mut rootfs = libcontainer::rootfs::RootFS::new();
+
+            let mut spec = Spec::default(); // load(self.manifest_store_dir().join("manifest.json"))?;
+            let mut linux = Linux::default();
+            linux.set_rootfs_propagation(Some("shared".to_owned()));
+            let mut root = RootBuilder::default()
+                .readonly(true)
+                .path(&root_dir)
+                .build()?;
+            spec.set_linux(Some(linux))
+                .set_mounts(None)
+                .set_hostname("trapped".to_owned().into())
+                .set_root(Some(root))
+                .set_hooks(None)
+                .set_annotations(None)
+                .set_domainname(Some("gensyn.ai".to_owned()));
+            gum::info!(target: LOG_TARGET, "Spec {spec:?}");
+            rootfs.prepare_rootfs(&spec, &root_dir, true, false)?;
+
+            // let mut process = ProcessBuilder::default();
+            // process.capabilities(Capability::SysAdmin).no_new_privileges(true).cwd(&root_dir).env(None).command_line(value)
+
+            let uuid = uuid::Uuid::new_v4();
+            let mut container =
+                ContainerBuilder::new(uuid.as_hyphenated().to_string(), SyscallType::default());
+            let container = container
+                .with_executor(DefaultExecutor {})
+                .with_root_path(&root_dir)?
+                .as_init("/tmp/oci/exec")
+                .with_detach(false)
+                .with_systemd(false)
+                .build()?;
+        } else {
+            let command_as_string = "cat /etc/os-release";
+            gum::info!(target: LOG_TARGET, "Attempting to run `sh -c {}` in {}", command_as_string, root_dir.display());
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c");
+            command.args(command_as_string.split(" "));
+            command.current_dir(&root_dir);
+            command.env_clear().env(
+                "PATH",
+                &format!(
+                    "{root_dir}/bin:{root_dir}/usr/bin/:{root_dir}/usr/local/bin:{root_dir}/sbin",
+                    root_dir = root_dir.display()
+                ),
+            );
+            dbg!(&command);
+
+            let output = command.output()?;
+            log_command_output(&output)?;
+
+            if !output.status.success() {
+                Err(Error::NoContainerCommandExecutionFailed)?
+            }
+        }
         Ok(())
     }
 }
@@ -259,8 +348,24 @@ async fn main() -> color_eyre::eyre::Result<()> {
     let fedora = "registry.fedoraproject.org/fedora:latest";
     let quay = "quay.io/drahnr/rust-glibc-builder";
     let busybox = "docker.io/library/busybox:latest";
-    houdini
-        .run(fedora)
-        .await?;
+    houdini.run(fedora).await?;
+    Ok(())
+}
+
+/// Unified parsing of the process output streams.
+///
+/// Log both `stdout` and `stderr` while adding line numbers to each.
+fn log_command_output(
+    output: &std::process::Output,
+) -> std::result::Result<(), std::str::Utf8Error> {
+    gum::info!(target: LOG_TARGET, "Output status = {:?}", output.status);
+    std::str::from_utf8(&output.stdout)?
+        .split('\n')
+        .enumerate()
+        .for_each(|(_, line)| gum::info!(target: LOG_TARGET, "stdout: {}", line));
+    std::str::from_utf8(&output.stderr)?
+        .split('\n')
+        .enumerate()
+        .for_each(|(_, line)| gum::info!(target: LOG_TARGET, "stderr: {}", line));
     Ok(())
 }
