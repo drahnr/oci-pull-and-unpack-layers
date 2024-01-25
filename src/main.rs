@@ -514,7 +514,7 @@ impl Houdini {
                 ]))
                 .set_cwd(PathBuf::from("/"))
                 .set_args(Some(Vec::from_iter(
-                    ["ls"]
+                    ["/usr/bin/bash", "-c", "ls"]
                         .into_iter()
                         .map(|x| x.to_owned()),
                 )))
