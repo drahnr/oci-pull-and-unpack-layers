@@ -13,7 +13,7 @@ use oci_distribution::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
     IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
 };
-use oci_spec::runtime::{Linux, LinuxCapabilities, RootBuilder, Spec};
+use oci_spec::runtime::{Linux, LinuxCapabilities, RootBuilder, Spec, User};
 use std::{
     collections::VecDeque,
     io::{Seek, SeekFrom},
@@ -160,6 +160,11 @@ fn unpack<T: std::io::Read + std::io::Seek>(
                     // relative, keep it
                     in_tar_original.clone()
                 } else {
+                    // FIXME TODO
+                    // in the container, we might need a different target for symlinks
+                    // since "/" has a different meaning. The following works for the _host_
+                    // but for the container I don't know how the namespaces / cgroups handle symlink targets.
+                    // There are _a lot_ of symlinks
                     unpack_dest.join(PathBuf::from_iter(in_tar_original.components().skip(1)))
                 };
                 if et == tar::EntryType::Symlink {
@@ -436,12 +441,14 @@ impl Houdini {
                 ]))
                 .set_cwd(PathBuf::from("/"))
                 .set_args(Some(Vec::from_iter(
-                    ["bash", "-c", "ls", "-al"]
+                    ["/usr/bin/bash", "-c", "ls"]
                         .into_iter()
                         .map(|x| x.to_owned()),
                 )))
                 .set_capabilities(Some(caps))
-                .set_no_new_privileges(Some(true));
+                .set_no_new_privileges(Some(true))
+                .set_terminal(Some(true));
+                // .set_user({ let mut user = User::default(); user.set_gid(0).set_uid(0); user});
 
             let root = RootBuilder::default()
                 .path(root_dir)
