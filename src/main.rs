@@ -1,6 +1,7 @@
 mod util;
 
 mod errors;
+use color_eyre::owo_colors::OwoColorize;
 use errors::*;
 use fs_err as fs;
 use libcontainer::{
@@ -14,6 +15,7 @@ use oci_distribution::manifest::{
 };
 use oci_spec::runtime::{Linux, LinuxCapabilities, RootBuilder, Spec};
 use std::{
+    collections::VecDeque,
     io::{Seek, SeekFrom},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::PathBuf,
@@ -100,19 +102,43 @@ fn unpack<T: std::io::Read + std::io::Seek>(
     // broken, doesn't handle hardlinks properly and causes permission issues
     // arch.unpack(unpack_dest)?;
     // return Ok(());
+    fn ensure_parent_dir_exists(path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let parent_dir = path
+            .as_ref()
+            .parent()
+            .expect("Parent dir exists, otherwise this is unsafe. qed");
+        ensure_dir_exists(parent_dir)
+    }
 
+    fn ensure_dir_exists(path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
+        gum::trace!(target: LOG_TARGET, "Attempting to create parent dir {}", path.display());
+
+        if let Err(e) = fs_err::create_dir_all(&path) {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                gum::error!(target: LOG_TARGET, "Failed to create parent dir {}: {:?}", path.display(), e);
+                Err(e)?
+            }
+            gum::trace!(target: LOG_TARGET, "Parent dir already exists {}, nothing to do", path.display());
+        }
+        Ok(())
+    }
+    let mut deferred = VecDeque::with_capacity(128);
+    let mut permission_fixups = VecDeque::with_capacity(128);
     for entry in arch.entries()? {
         let mut entry = entry?;
         let in_tar_relative_path = entry.path()?.to_path_buf();
         let in_tar_relative_path = PathBuf::from_iter(in_tar_relative_path.components().skip(1));
         let unpack_file_dest = unpack_dest.join(&in_tar_relative_path);
 
-        fs_err::create_dir_all(unpack_file_dest.parent().unwrap())?;
-        match dbg!(entry.header().entry_type()) {
-            tar::EntryType::Directory => {
-                fs_err::create_dir_all(unpack_file_dest)?;
-            }
+        let Ok(mode) = entry.header().mode() else {
+            gum::warn!(target: LOG_TARGET, "Missing mode, skipping unpack of {}", in_tar_relative_path.display());
+            continue;
+        };
+        match entry.header().entry_type() {
             tar::EntryType::Regular => {
+                gum::info!(target: LOG_TARGET, "Unpacking  (1st round, regular files) {} to {}", in_tar_relative_path.display(), unpack_file_dest.display());
+                ensure_parent_dir_exists(&unpack_file_dest)?;
                 let mut dest_f = fs_err::OpenOptions::new()
                     .create(true)
                     .write(true)
@@ -120,54 +146,77 @@ fn unpack<T: std::io::Read + std::io::Seek>(
                     .open(unpack_file_dest)?;
                 std::io::copy(&mut entry, &mut dest_f)?;
             }
-            _ => {}
+            // symlinks can be dirs, if we create the files earlier and ensure parent dirs, we have to also create all parent symlinks
+            et @ tar::EntryType::Symlink | et @ tar::EntryType::Link => {
+                ensure_parent_dir_exists(&unpack_file_dest)?;
+
+                let in_tar_link = entry.path()?.to_path_buf();
+                let in_tar_original = entry.link_name()?.unwrap().to_path_buf();
+
+                // link is always an abosolute path, that's what we need to create
+                let link = unpack_dest.join(PathBuf::from_iter(in_tar_link.components().skip(1)));
+                // original file can be _relative_ to the link path or absolute
+                let original = if in_tar_original.starts_with("..") {
+                    // relative, keep it
+                    in_tar_original.clone()
+                } else {
+                    unpack_dest.join(PathBuf::from_iter(in_tar_original.components().skip(1)))
+                };
+                if et == tar::EntryType::Symlink {
+                    gum::debug!(target: LOG_TARGET, "Creating symbolic link at {link} pointing to {orig}", link=link.display(), orig=original.display());
+                    fs::soft_link(&original, &link)?;
+                    permission_fixups.push_back((et, link, mode));
+                } else {
+                    gum::debug!(target: LOG_TARGET, "Creating hard link at {link} pointing to {orig}", link=link.display(), orig=original.display());
+                    fs::hard_link(&original, &link)?;
+                    permission_fixups.push_back((et, link, mode));
+                }
+                // symlinks don't work
+            }
+            _ => {
+                deferred.push_back(entry);
+            }
         }
     }
 
-    let mut inner = arch.into_inner();
-    inner.seek(SeekFrom::Start(0))?;
-    let mut arch = tar::Archive::new(inner);
-    for entry in arch.entries()? {
-        let entry = entry?;
-        let in_tar_relative_path = entry.path()?.to_path_buf();
-        let in_tar_relative_path = PathBuf::from_iter(in_tar_relative_path.components().skip(1));
+    for entry in deferred {
+        let in_tar_relative_path_orig = entry.path()?.to_path_buf();
+        let in_tar_relative_path =
+            PathBuf::from_iter(in_tar_relative_path_orig.components().skip(1));
         let unpack_file_dest = unpack_dest.join(&in_tar_relative_path);
-        gum::info!(target: LOG_TARGET, "Unpacking {} to {}", in_tar_relative_path.display(), unpack_file_dest.display());
+        if !entry.header().entry_type().is_file() {
+            gum::info!(target: LOG_TARGET, "Unpacking  (2nd round, non-regular files) {} to {}", in_tar_relative_path.display(), unpack_file_dest.display());
+        }
+        ensure_parent_dir_exists(&unpack_file_dest)?;
 
-        fs_err::create_dir_all(unpack_file_dest.parent().unwrap())?;
-        match dbg!(entry.header().entry_type()) {
-            tar::EntryType::Link => {
-                let link_to_create = entry.link_name()?.unwrap().to_path_buf();
-                let _ = fs_err::hard_link(link_to_create, unpack_file_dest);
+        let Ok(mode) = entry.header().mode() else {
+            gum::warn!(target: LOG_TARGET, "Missing mode, skipping unpack of {}", in_tar_relative_path.display());
+            continue;
+        };
+        match entry.header().entry_type() {
+            et @ tar::EntryType::Directory => {
+                ensure_dir_exists(&unpack_file_dest)?;
+                permission_fixups.push_back((et, unpack_file_dest, mode));
             }
-            tar::EntryType::Symlink => {
-                let link_to_create = entry.link_name()?.unwrap().to_path_buf();
-                let _ = fs_err::soft_link(link_to_create, unpack_file_dest);
+            et @ tar::EntryType::Regular => {
+                let d = entry.path()?.to_path_buf();
+                permission_fixups.push_back((et, unpack_file_dest, mode));
             }
-            tar::EntryType::Directory | tar::EntryType::Regular => { /* already handled */ }
             et => {
                 gum::info!(target: LOG_TARGET, "{:?}, unhandled, skipping..", et);
             }
         }
     }
 
-    let mut inner = arch.into_inner();
-    inner.seek(SeekFrom::Start(0))?;
-    let mut arch = tar::Archive::new(inner);
-    for entry in arch.entries()? {
-        let entry = entry?;
-        let in_tar_relative_path = entry.path()?.to_path_buf();
-        let in_tar_relative_path = PathBuf::from_iter(in_tar_relative_path.components().skip(1));
-        let unpack_file_dest = unpack_dest.join(&in_tar_relative_path);
+    gum::info!(target: LOG_TARGET, "Applying permissions..");
 
-        if !entry.header().entry_type().is_symlink() {
-            use std::os::unix::prelude::*;
-            let mode = entry.header().mode()?;
-            let mode = mode & !mask;
-            let perm = std::fs::Permissions::from_mode(mode as _);
-            if let Err(e) = fs_err::set_permissions(&unpack_file_dest, perm) {
-                gum::error!(target: LOG_TARGET, "Failed to set permissions ({:o}) for {}: {:?}", mode, unpack_file_dest.display(), e);
-            }
+    // deferred permissioning, avoids setting permissions on a dir that'd still have files yet to be unpacked
+    for (et, path, mode) in permission_fixups {
+        use std::os::unix::prelude::*;
+        let mode = mode & !mask;
+        let perm = std::fs::Permissions::from_mode(mode as _);
+        if let Err(e) = fs_err::set_permissions(&path, perm) {
+            gum::error!(target: LOG_TARGET, "Failed to set permissions ({:o}) for {} of type {:?}: {:?}", mode.red(), path.display(), et.yellow(), e);
         }
     }
 
@@ -420,10 +469,7 @@ impl Houdini {
                 container_id.as_hyphenated().to_string(),
                 SyscallType::default(),
             );
-            let container_state_dir = self
-                .extract_base
-                .join("container-state")
-                .join(container_id.hyphenated().to_string());
+            let container_state_dir = self.extract_base.join("container-state"); // auto suffixed by the container id
             fs_err::create_dir_all(&container_state_dir)?;
             let mut container = container
                 .with_executor(DefaultExecutor {})
@@ -433,6 +479,7 @@ impl Houdini {
                 .with_detach(false)
                 .with_systemd(false)
                 .build()?;
+            gum::info!("Container {container_id:?} torn down, pending deletion.");
             container.start().map_err(|e| {
                 let _ = dbg!(container.delete(true));
                 e
