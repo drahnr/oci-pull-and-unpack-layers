@@ -13,10 +13,12 @@ use oci_distribution::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
     IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
 };
-use oci_spec::runtime::{Linux, LinuxCapabilities, RootBuilder, Spec, User};
+use oci_spec::runtime::{
+    Linux, LinuxCapabilities, LinuxIdMapping, LinuxIdMappingBuilder, RootBuilder, Spec,
+};
 use std::{
     collections::VecDeque,
-    io::{Seek, SeekFrom},
+    io::Seek,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::PathBuf,
 };
@@ -135,9 +137,11 @@ fn unpack<T: std::io::Read + std::io::Seek>(
             gum::warn!(target: LOG_TARGET, "Missing mode, skipping unpack of {}", in_tar_relative_path.display());
             continue;
         };
+        let uid = entry.header().uid()?;
+        let gid = entry.header().gid()?;
         match entry.header().entry_type() {
             tar::EntryType::Regular => {
-                gum::info!(target: LOG_TARGET, "Unpacking  (1st round, regular files) {} to {}", in_tar_relative_path.display(), unpack_file_dest.display());
+                gum::trace!(target: LOG_TARGET, "Unpacking  (1st round, regular files) {} to {}", in_tar_relative_path.display(), unpack_file_dest.display());
                 ensure_parent_dir_exists(&unpack_file_dest)?;
                 let mut dest_f = fs_err::OpenOptions::new()
                     .create(true)
@@ -167,14 +171,18 @@ fn unpack<T: std::io::Read + std::io::Seek>(
                     // There are _a lot_ of symlinks
                     unpack_dest.join(PathBuf::from_iter(in_tar_original.components().skip(1)))
                 };
+                if link == original {
+                    gum::warn!(target: LOG_TARGET, "Contains self targeted link {}.", link.display().blue());
+                    continue;
+                }
                 if et == tar::EntryType::Symlink {
                     gum::debug!(target: LOG_TARGET, "Creating symbolic link at {link} pointing to {orig}", link=link.display(), orig=original.display());
                     fs::soft_link(&original, &link)?;
-                    permission_fixups.push_back((et, link, mode));
+                    permission_fixups.push_back((et, link.clone(), mode, uid, gid));
                 } else {
                     gum::debug!(target: LOG_TARGET, "Creating hard link at {link} pointing to {orig}", link=link.display(), orig=original.display());
                     fs::hard_link(&original, &link)?;
-                    permission_fixups.push_back((et, link, mode));
+                    permission_fixups.push_back((et, link.clone(), mode, uid, gid));
                 }
                 // symlinks don't work
             }
@@ -190,7 +198,7 @@ fn unpack<T: std::io::Read + std::io::Seek>(
             PathBuf::from_iter(in_tar_relative_path_orig.components().skip(1));
         let unpack_file_dest = unpack_dest.join(&in_tar_relative_path);
         if !entry.header().entry_type().is_file() {
-            gum::info!(target: LOG_TARGET, "Unpacking  (2nd round, non-regular files) {} to {}", in_tar_relative_path.display(), unpack_file_dest.display());
+            gum::trace!(target: LOG_TARGET, "Unpacking  (2nd round, non-regular files) {} to {}", in_tar_relative_path.display(), unpack_file_dest.display());
         }
         ensure_parent_dir_exists(&unpack_file_dest)?;
 
@@ -198,29 +206,45 @@ fn unpack<T: std::io::Read + std::io::Seek>(
             gum::warn!(target: LOG_TARGET, "Missing mode, skipping unpack of {}", in_tar_relative_path.display());
             continue;
         };
+        let uid = entry.header().uid()?;
+        let gid = entry.header().gid()?;
         match entry.header().entry_type() {
             et @ tar::EntryType::Directory => {
                 ensure_dir_exists(&unpack_file_dest)?;
-                permission_fixups.push_back((et, unpack_file_dest, mode));
+                // don't attempt to change the destination folder owner
+                if unpack_file_dest != unpack_dest {
+                    permission_fixups.push_back((et, unpack_file_dest, mode, uid, gid));
+                }
             }
             et @ tar::EntryType::Regular => {
-                let d = entry.path()?.to_path_buf();
-                permission_fixups.push_back((et, unpack_file_dest, mode));
+                permission_fixups.push_back((et, unpack_file_dest, mode, uid, gid));
             }
             et => {
-                gum::info!(target: LOG_TARGET, "{:?}, unhandled, skipping..", et);
+                gum::debug!(target: LOG_TARGET, "{:?}, unhandled, skipping..", et);
             }
         }
     }
 
     gum::info!(target: LOG_TARGET, "Applying permissions..");
 
+    let ignore_owner = true; // a regular owner cannot change ownership to i.e. root
+
     // deferred permissioning, avoids setting permissions on a dir that'd still have files yet to be unpacked
-    for (et, path, mode) in permission_fixups {
+    for (et, path, mode, uid, gid) in permission_fixups {
         use std::os::unix::prelude::*;
+
+        if !ignore_owner {
+            gum::info!(target: LOG_TARGET, "Setin ownershop {uid}:{gid} and {mode:o} of {}", path.display());
+            if !et.is_symlink() && !et.is_hard_link() {
+                if let Err(e) = chown(&path, uid, gid) {
+                    gum::error!(target: LOG_TARGET, "Failed to change owner: {e:?}");
+                }
+            }
+        }
+
         let mode = mode & !mask;
         let perm = std::fs::Permissions::from_mode(mode as _);
-        if let Err(e) = fs_err::set_permissions(&path, perm) {
+        if let Err(e) = chmod(&path, perm) {
             gum::error!(target: LOG_TARGET, "Failed to set permissions ({:o}) for {} of type {:?}: {:?}", mode.red(), path.display(), et.yellow(), e);
         }
     }
@@ -228,6 +252,55 @@ fn unpack<T: std::io::Read + std::io::Seek>(
     // TODO fixup permissions in a 3rd loop
     Ok(())
 }
+
+fn chown(path: &std::path::Path, uid: u64, gid: u64) -> std::io::Result<()> {
+    use std::io;
+    use std::os::unix::prelude::*;
+
+    let uid: libc::uid_t = uid.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("UID {} is {} too large!", uid, path.display()),
+        )
+    })?;
+    let gid: libc::gid_t = gid.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("GID {} for {} is too large!", gid, path.display()),
+        )
+    })?;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("path {} contains null character: {:?}", path.display(), e),
+        )
+    })?;
+
+    unsafe {
+        let ret = libc::lchown(cpath.as_ptr(), uid, gid);
+        if ret != 0 {
+            let e = io::Error::last_os_error();
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "Failed to set ownership {}:{} of {path} with code {code}: {e:?}",
+                    uid,
+                    gid,
+                    code = ret,
+                    path = path.display(),
+                    e = e
+                ),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn chmod(path: &std::path::Path, perms: std::fs::Permissions) -> std::io::Result<()> {
+    fs_err::set_permissions(&path, perms)
+}
+
 fn unpack_akv(
     arch: &mut akv::reader::ArchiveReader<'_>,
     blob_src: &std::path::Path,
@@ -238,7 +311,7 @@ fn unpack_akv(
     while let Some(entry) = arch.next_entry()? {
         let in_tar_relative_path = entry.pathname_utf8()?;
         let unpack_file_dest = unpack_dest.join(in_tar_relative_path);
-        gum::info!(target: LOG_TARGET, "Unpacking {} to {}", in_tar_relative_path, unpack_file_dest.display());
+        gum::trace!(target: LOG_TARGET, "Unpacking {} to {}", in_tar_relative_path, unpack_file_dest.display());
         let mut entry_reader = entry.into_reader();
         if let Ok(mut dest_f) = fs_err::OpenOptions::new()
             .create(true)
@@ -430,9 +503,9 @@ impl Houdini {
             // .effective(Capability::SysAdmin).build()?;
 
             let mut spec = Spec::default(); // load(self.manifest_store_dir().join("config.json"))?;
-            let _root = RootBuilder::default();
             let mut linux = Linux::rootless(1000, 1000);
-            linux.set_rootfs_propagation(Some("shared".to_owned()));
+
+            // linux.set_rootfs_propagation(Some("shared".to_owned()));
 
             let mut process = oci_spec::runtime::Process::default();
             process
@@ -448,11 +521,16 @@ impl Houdini {
                 .set_capabilities(Some(caps))
                 .set_no_new_privileges(Some(true))
                 .set_terminal(Some(true));
-                // .set_user({ let mut user = User::default(); user.set_gid(0).set_uid(0); user});
+            // .set_user({ let mut user = User::default(); user.set_gid(0).set_uid(0); user});
 
             let root = RootBuilder::default()
                 .path(root_dir)
-                .readonly(false)
+                .readonly(true)
+                .build()?;
+            let mut lidmap = LinuxIdMappingBuilder::default()
+                .host_id(1000_u32)
+                .container_id(0_u32)
+                .size(1_u32)
                 .build()?;
             spec.set_linux(Some(linux))
                 .set_mounts(Some(vec![]))
@@ -460,8 +538,8 @@ impl Houdini {
                 .set_root(Some(root))
                 .set_hooks(None)
                 .set_annotations(None)
-                .set_domainname(Some("gensyn.ai".to_owned()))
-                .set_process(Some(process));
+                .set_process(Some(process))
+                .set_uid_mappings(Some(vec![lidmap]));
             gum::info!(target: LOG_TARGET, "Spec {spec:?}");
 
             // not sure this is required?

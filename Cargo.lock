@@ -1464,6 +1464,7 @@ dependencies = [
  "fatality",
  "flate2",
  "fs-err",
+ "libc",
  "libcontainer",
  "log",
  "oci-distribution",
