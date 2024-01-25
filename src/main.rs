@@ -527,6 +527,8 @@ impl Houdini {
                 .path(root_dir)
                 .readonly(true)
                 .build()?;
+            // mAbye fuck here?
+            // Stan: will fail on some machines due to different host uid/gid mappings, only if the host uid mapping is a superset of this one it'll work
             let mut lidmap = LinuxIdMappingBuilder::default()
                 .host_id(1000_u32)
                 .container_id(0_u32)
@@ -564,11 +566,11 @@ impl Houdini {
                 .with_detach(false)
                 .with_systemd(false)
                 .build()?;
-            gum::info!("Container {container_id:?} torn down, pending deletion.");
             container.start().map_err(|e| {
                 let _ = dbg!(container.delete(true));
                 e
             })?;
+            gum::info!("Container {container_id:?} torn down, pending deletion.");
             container.delete(true)?;
         } else {
             let command_as_string = "ls -al";
