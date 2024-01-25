@@ -98,13 +98,15 @@ fn unpack<T: std::io::Read + std::io::Seek>(
     let mut metadata = unpack_dest.metadata()?;
     metadata.permissions().set_mode(0o777);
 
+    let mask = 0o022;
     gum::warn!(target: LOG_TARGET, "Unpacking (tar-rs) layer {} to: {}", blob_src.display(), unpack_dest.display());
     arch.set_unpack_xattrs(true);
     arch.set_overwrite(true);
-    arch.set_mask(0o022);
+    arch.set_mask(mask);
     arch.set_preserve_mtime(false);
     arch.set_preserve_permissions(true);
     arch.set_preserve_ownerships(false);
+    // broken, doesn't handle hardlinks properly and causes permission issues
     // arch.unpack(unpack_dest)?;
     // return Ok(());
 
@@ -157,6 +159,7 @@ fn unpack<T: std::io::Read + std::io::Seek>(
             }
         }
     }
+
     let mut inner = arch.into_inner();
     inner.seek(SeekFrom::Start(0))?;
     let mut arch = tar::Archive::new(inner);
@@ -166,7 +169,15 @@ fn unpack<T: std::io::Read + std::io::Seek>(
         let in_tar_relative_path = PathBuf::from_iter(in_tar_relative_path.components().skip(1));
         let unpack_file_dest = unpack_dest.join(&in_tar_relative_path);
 
-        // TODO preserve permissions
+        if !entry.header().entry_type().is_symlink() {
+            use std::os::unix::prelude::*;
+            let mode = entry.header().mode()?;
+            let mode = mode & !mask;
+            let perm = std::fs::Permissions::from_mode(mode as _);
+            if let Err(e) = fs_err::set_permissions(&unpack_file_dest, perm) {
+                gum::error!(target: LOG_TARGET, "Failed to set permissions ({:o}) for {}", mode, unpack_file_dest.display());
+            }
+        }
     }
 
     // TODO fixup permissions in a 3rd loop
@@ -367,10 +378,10 @@ impl Houdini {
 
         if true {
             // create /dev in case it doesn't exist yet, it likely won't
-            let _ = fs_err::create_dir(dbg!(root_dir.join("dev")));
-            fs_err::set_permissions(root_dir.join("dev"), Permissions::from_mode(0o777_u32))?; // otherwise we can't symlink /proc/kcore to /dev/kcore in the intermediate process
-            let _ = fs_err::create_dir(dbg!(root_dir.join("proc")));
-            fs_err::set_permissions(root_dir.join("proc"), Permissions::from_mode(0o777_u32))?;
+            // let _ = fs_err::create_dir(dbg!(root_dir.join("dev")));
+            // fs_err::set_permissions(root_dir.join("dev"), Permissions::from_mode(0o777_u32))?; // otherwise we can't symlink /proc/kcore to /dev/kcore in the intermediate process
+            // let _ = fs_err::create_dir(dbg!(root_dir.join("proc")));
+            // fs_err::set_permissions(root_dir.join("proc"), Permissions::from_mode(0o777_u32))?;
 
             let caps = LinuxCapabilities::default();
             // .ambient(Capability::SysAdmin)
@@ -422,9 +433,11 @@ impl Houdini {
                 container_id.as_hyphenated().to_string(),
                 SyscallType::default(),
             );
+            let container_state_dir = self.extract_base.join("container-state").join(container_id.hyphenated().to_string());
+            fs_err::create_dir_all(&container_state_dir)?;
             let mut container = container
                 .with_executor(DefaultExecutor {})
-                .with_root_path(&root_dir)?
+                .with_root_path(&container_state_dir)?
                 .validate_id()?
                 .as_init(&bundle_dir)
                 .with_detach(false)
