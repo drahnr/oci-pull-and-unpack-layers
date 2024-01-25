@@ -1,30 +1,21 @@
 mod util;
-use fs::os::unix::fs::FileExt;
+
 mod errors;
 use errors::*;
 use fs_err as fs;
 use libcontainer::{
-    container::{builder::ContainerBuilder, ContainerStatus},
-    rootfs::Device,
-    syscall::syscall::SyscallType,
+    container::builder::ContainerBuilder, syscall::syscall::SyscallType,
     workload::default::DefaultExecutor,
 };
-use oci_distribution::manifest::OciManifest;
+
 use oci_distribution::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
     IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
 };
-use oci_spec::{
-    image::{Arch, ImageConfigurationBuilder},
-    runtime::{
-        Capability, Linux, LinuxCapabilities, LinuxCapabilitiesBuilder, LinuxNamespace, Mount,
-        ProcessBuilder, Root, RootBuilder, Spec,
-    },
-};
+use oci_spec::runtime::{Linux, LinuxCapabilities, RootBuilder, Spec};
 use std::{
-    fs::Permissions,
-    io::{Cursor, Seek, SeekFrom},
-    os::unix::fs::{chown, chroot, MetadataExt, PermissionsExt},
+    io::{Seek, SeekFrom},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::PathBuf,
 };
 
@@ -95,7 +86,7 @@ fn unpack<T: std::io::Read + std::io::Seek>(
     unpack_dest: &std::path::Path,
 ) -> std::io::Result<()> {
     // without it, `motd.d` won't unpack successfully
-    let mut metadata = unpack_dest.metadata()?;
+    let metadata = unpack_dest.metadata()?;
     metadata.permissions().set_mode(0o777);
 
     let mask = 0o022;
@@ -137,7 +128,7 @@ fn unpack<T: std::io::Read + std::io::Seek>(
     inner.seek(SeekFrom::Start(0))?;
     let mut arch = tar::Archive::new(inner);
     for entry in arch.entries()? {
-        let mut entry = entry?;
+        let entry = entry?;
         let in_tar_relative_path = entry.path()?.to_path_buf();
         let in_tar_relative_path = PathBuf::from_iter(in_tar_relative_path.components().skip(1));
         let unpack_file_dest = unpack_dest.join(&in_tar_relative_path);
@@ -164,7 +155,7 @@ fn unpack<T: std::io::Read + std::io::Seek>(
     inner.seek(SeekFrom::Start(0))?;
     let mut arch = tar::Archive::new(inner);
     for entry in arch.entries()? {
-        let mut entry = entry?;
+        let entry = entry?;
         let in_tar_relative_path = entry.path()?.to_path_buf();
         let in_tar_relative_path = PathBuf::from_iter(in_tar_relative_path.components().skip(1));
         let unpack_file_dest = unpack_dest.join(&in_tar_relative_path);
@@ -175,7 +166,7 @@ fn unpack<T: std::io::Read + std::io::Seek>(
             let mode = mode & !mask;
             let perm = std::fs::Permissions::from_mode(mode as _);
             if let Err(e) = fs_err::set_permissions(&unpack_file_dest, perm) {
-                gum::error!(target: LOG_TARGET, "Failed to set permissions ({:o}) for {}", mode, unpack_file_dest.display());
+                gum::error!(target: LOG_TARGET, "Failed to set permissions ({:o}) for {}: {:?}", mode, unpack_file_dest.display(), e);
             }
         }
     }
@@ -279,8 +270,7 @@ impl Houdini {
                 idx = idx,
                 digest = &layer.digest
             );
-            let layer_blob_path =
-                layer_blob_dir.join(&layer.digest.split(":").skip(1).next().unwrap());
+            let layer_blob_path = layer_blob_dir.join(layer.digest.split(':').nth(1).unwrap());
             // fs_err::create_dir_all(&layer_blob_path)?;
             // TODO use filelock here, to avoid accidental concurrency fuckups
 
@@ -307,12 +297,11 @@ impl Houdini {
                         digest
                     }
                 }
-                    == const_hex::decode(dbg!(&layer.digest.split(":").skip(1).next().unwrap()))
-                        .unwrap()
+                    == const_hex::decode(dbg!(&layer.digest.split(':').nth(1).unwrap())).unwrap()
             }) {
                 gum::info!(target: LOG_TARGET, "Layer blob already exists on disk {}, skipping download", layer_blob_path.display());
             } else {
-                let mut blob_file = fs_err::OpenOptions::new()
+                let blob_file = fs_err::OpenOptions::new()
                     .create(true)
                     .truncate(true)
                     .write(true)
@@ -334,9 +323,8 @@ impl Houdini {
             match dbg!(layer.media_type.as_str()) {
                 // FIXME verify these are identicaly for sure
                 IMAGE_LAYER_MEDIA_TYPE | IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE => {
-                    let mut arch = tar::Archive::new(&mut blob);
+                    let arch = tar::Archive::new(&mut blob);
                     unpack(arch, &layer_blob_path, &unpack_dest)?;
-                    continue;
                     // let mut arch = akv::reader::ArchiveReader::open_io(&mut blob)?;
                     // unpack_akv(&mut arch, &layer_blob_path,  &unpack_dest)?;
                 }
@@ -347,9 +335,8 @@ impl Houdini {
                     std::io::copy(&mut gzdecoder, &mut decompressed)?;
                     decompressed.seek(std::io::SeekFrom::Start(0))?;
                     // `tar-rs` fails with hardlinks and some permissions, `libarchive` works just fine.
-                    let mut arch = tar::Archive::new(decompressed);
+                    let arch = tar::Archive::new(decompressed);
                     unpack(arch, &layer_blob_path, &unpack_dest)?;
-                    continue;
                     // let mut arch = akv::reader::ArchiveReader::open_io(&mut decompressed)?;
                     // unpack_akv(&mut arch, &layer_blob_path, &unpack_dest)?;
                 }
@@ -374,7 +361,7 @@ impl Houdini {
         let root_dir = unpacked_container_contents;
         let bundle_dir = root_dir.parent().unwrap();
 
-        assert!(fs_err::metadata(&root_dir)?.is_dir());
+        assert!(fs_err::metadata(root_dir)?.is_dir());
 
         if true {
             // create /dev in case it doesn't exist yet, it likely won't
@@ -389,7 +376,7 @@ impl Houdini {
             // .effective(Capability::SysAdmin).build()?;
 
             let mut spec = Spec::default(); // load(self.manifest_store_dir().join("config.json"))?;
-            let mut root = RootBuilder::default();
+            let _root = RootBuilder::default();
             let mut linux = Linux::rootless(1000, 1000);
             linux.set_rootfs_propagation(Some("shared".to_owned()));
 
@@ -408,7 +395,7 @@ impl Houdini {
                 .set_no_new_privileges(Some(true));
 
             let root = RootBuilder::default()
-                .path(&root_dir)
+                .path(root_dir)
                 .readonly(false)
                 .build()?;
             spec.set_linux(Some(linux))
@@ -429,23 +416,26 @@ impl Houdini {
             let config_json = serde_json::to_string_pretty(&spec).unwrap();
             fs_err::write(bundle_dir.join("config.json"), config_json.as_bytes()).unwrap();
 
-            let mut container = ContainerBuilder::new(
+            let container = ContainerBuilder::new(
                 container_id.as_hyphenated().to_string(),
                 SyscallType::default(),
             );
-            let container_state_dir = self.extract_base.join("container-state").join(container_id.hyphenated().to_string());
+            let container_state_dir = self
+                .extract_base
+                .join("container-state")
+                .join(container_id.hyphenated().to_string());
             fs_err::create_dir_all(&container_state_dir)?;
             let mut container = container
                 .with_executor(DefaultExecutor {})
                 .with_root_path(&container_state_dir)?
                 .validate_id()?
-                .as_init(&bundle_dir)
+                .as_init(bundle_dir)
                 .with_detach(false)
                 .with_systemd(false)
                 .build()?;
-            container.start().or_else(|e| {
+            container.start().map_err(|e| {
                 let _ = dbg!(container.delete(true));
-                Err(e)
+                e
             })?;
             container.delete(true)?;
         } else {
@@ -453,8 +443,8 @@ impl Houdini {
             gum::info!(target: LOG_TARGET, "Attempting to run `sh -c {}` in {}", command_as_string, root_dir.display());
             let mut command = std::process::Command::new("sh");
             command.arg("-c");
-            command.args(command_as_string.split(" "));
-            command.current_dir(&root_dir);
+            command.args(command_as_string.split(' '));
+            command.current_dir(root_dir);
             command.env_clear().env(
                 "PATH",
                 &format!(
@@ -491,10 +481,10 @@ async fn main() -> color_eyre::eyre::Result<()> {
             .join("oci-overlayer")
             .join("blobs"),
     };
-    let ubuntu = "docker.io/library/ubuntu:latest";
+    let _ubuntu = "docker.io/library/ubuntu:latest";
     let fedora = "registry.fedoraproject.org/fedora:latest";
-    let quay = "quay.io/drahnr/rust-glibc-builder";
-    let busybox = "docker.io/library/busybox:latest";
+    let _quay = "quay.io/drahnr/rust-glibc-builder";
+    let _busybox = "docker.io/library/busybox:latest";
     houdini.run(fedora).await?;
     Ok(())
 }
