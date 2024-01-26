@@ -1467,6 +1467,7 @@ dependencies = [
  "libc",
  "libcontainer",
  "log",
+ "nix 0.27.1",
  "oci-distribution",
  "oci-spec",
  "once_cell",

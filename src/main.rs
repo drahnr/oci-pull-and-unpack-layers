@@ -8,13 +8,15 @@ use libcontainer::{
     container::builder::ContainerBuilder, syscall::syscall::SyscallType,
     workload::default::DefaultExecutor,
 };
+use color_eyre::eyre::ContextCompat;
+use color_eyre::eyre::WrapErr;
 
 use oci_distribution::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
     IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
 };
 use oci_spec::runtime::{
-    Linux, LinuxCapabilities, LinuxIdMapping, LinuxIdMappingBuilder, RootBuilder, Spec,
+    Linux, LinuxCapabilities, LinuxIdMapping, LinuxIdMappingBuilder, Mount, MountBuilder, RootBuilder, Spec
 };
 use std::{
     collections::VecDeque,
@@ -158,22 +160,24 @@ fn unpack<T: std::io::Read + std::io::Seek>(
                 let in_tar_original = entry.link_name()?.unwrap().to_path_buf();
 
                 // link is always an abosolute path, that's what we need to create
-                let link = unpack_dest.join(PathBuf::from_iter(in_tar_link.components().skip(1)));
+                let link = unpack_dest.join(PathBuf::from_iter(in_tar_link.components()));
                 // original file can be _relative_ to the link path or absolute
-                let original = if in_tar_original.starts_with("..") {
-                    // relative, keep it
-                    in_tar_original.clone()
-                } else {
+                let original = if in_tar_original.starts_with("./") {
                     // FIXME TODO
                     // in the container, we might need a different target for symlinks
                     // since "/" has a different meaning. The following works for the _host_
                     // but for the container I don't know how the namespaces / cgroups handle symlink targets.
                     // There are _a lot_ of symlinks
-                    unpack_dest.join(PathBuf::from_iter(in_tar_original.components().skip(1)))
+                    unpack_dest.join(PathBuf::from_iter(in_tar_original.components()))
+                } else {
+                    // relative, keep it
+                    in_tar_original.clone()
                 };
                 if link == original {
-                    gum::warn!(target: LOG_TARGET, "Contains self targeted link {}.", link.display().blue());
-                    continue;
+                    gum::debug!(target: LOG_TARGET, "original: {} link file to be created: {}", in_tar_original.display(), in_tar_link.display());
+                    gum::error!(target: LOG_TARGET, "Contains self targeted link {}.", link.display().blue());
+                    panic!("Should never happen");
+                
                 }
                 if et == tar::EntryType::Symlink {
                     gum::debug!(target: LOG_TARGET, "Creating symbolic link at {link} pointing to {orig}", link=link.display(), orig=original.display());
@@ -325,6 +329,76 @@ fn unpack_akv(
         }
     }
     Ok(())
+}
+
+use nix::{
+    sys::{
+        signal::{self, kill},
+        signalfd::SigSet,
+        wait::{waitpid, WaitPidFlag, WaitStatus},
+    },
+    unistd::Pid,
+};
+
+fn handle_foreground(init_pid: Pid) -> color_eyre::eyre::Result<i32> {
+    // We mask all signals here and forward most of the signals to the container
+    // init process.
+    let signal_set = SigSet::all();
+    signal_set
+        .thread_block()
+        .with_context(|| "failed to call pthread_sigmask")?;
+    loop {
+        match signal_set
+            .wait()
+            .with_context(|| "failed to call sigwait")?
+        {
+            signal::SIGCHLD => {
+                // Reap all child until either container init process exits or
+                // no more child to be reaped. Once the container init process
+                // exits we can then return.
+                gum::trace!("reaping child processes");
+                loop {
+                    match waitpid(None, Some(WaitPidFlag::WNOHANG))? {
+                        WaitStatus::Exited(pid, status) => {
+                            if pid.eq(&init_pid) {
+                                return Ok(status);
+                            }
+
+                            // Else, some random child process exited, ignoring...
+                        }
+                        WaitStatus::Signaled(pid, signal, _) => {
+                            if pid.eq(&init_pid) {
+                                return Ok(signal as i32);
+                            }
+
+                            // Else, some random child process exited, ignoring...
+                        }
+                        WaitStatus::StillAlive => {
+                            // No more child to reap.
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            signal::SIGURG => {
+                // In `runc`, SIGURG is used by go runtime and should not be forwarded to
+                // the container process. Here, we just ignore the signal.
+            }
+            signal::SIGWINCH => {
+                // TODO: resize the terminal
+            }
+            signal => {
+                gum::trace!("forwarding signal");
+                // There is nothing we can do if we fail to forward the signal.
+                let _ = kill(init_pid, Some(signal)).map_err(|err| {
+                    gum::warn!(
+                        "failed to forward signal to container init process",
+                    );
+                });
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -514,7 +588,7 @@ impl Houdini {
                 ]))
                 .set_cwd(PathBuf::from("/"))
                 .set_args(Some(Vec::from_iter(
-                    ["ls"]
+                    ["ls", "-al"]
                         .into_iter()
                         .map(|x| x.to_owned()),
                 )))
@@ -534,6 +608,7 @@ impl Houdini {
                 .container_id(0_u32)
                 .size(1_u32)
                 .build()?;
+            let mount = MountBuilder::default().destination("/lib64").typ("bind".to_owned()).source("/usr/lib64").build().unwrap();
             spec.set_linux(Some(linux))
                 .set_mounts(Some(vec![]))
                 .set_hostname("trapped".to_owned().into())
@@ -570,30 +645,31 @@ impl Houdini {
                 let _ = dbg!(container.delete(true));
                 e
             })?;
+            handle_foreground(container.pid().expect("Container Must have PID"))?;
             gum::info!("Container {container_id:?} torn down, pending deletion.");
             container.delete(true)?;
         } else {
-            let command_as_string = "ls -al";
-            gum::info!(target: LOG_TARGET, "Attempting to run `sh -c {}` in {}", command_as_string, root_dir.display());
-            let mut command = std::process::Command::new("sh");
-            command.arg("-c");
-            command.args(command_as_string.split(' '));
-            command.current_dir(root_dir);
-            command.env_clear().env(
-                "PATH",
-                &format!(
-                    "{root_dir}/bin:{root_dir}/usr/bin/:{root_dir}/usr/local/bin:{root_dir}/sbin",
-                    root_dir = root_dir.display()
-                ),
-            );
-            dbg!(&command);
+            // let command_as_string = "ls -al";
+            // gum::info!(target: LOG_TARGET, "Attempting to run `sh -c {}` in {}", command_as_string, root_dir.display());
+            // let mut command = std::process::Command::new("sh");
+            // command.arg("-c");
+            // command.args(command_as_string.split(' '));
+            // command.current_dir(root_dir);
+            // command.env_clear().env(
+            //     "PATH",
+            //     &format!(
+            //         "{root_dir}/bin:{root_dir}/usr/bin/:{root_dir}/usr/local/bin:{root_dir}/sbin",
+            //         root_dir = root_dir.display()
+            //     ),
+            // );
+            // dbg!(&command);
 
-            let output = command.output()?;
-            log_command_output(&output)?;
+            // let output = command.output()?;
+            // log_command_output(&output)?;
 
-            if !output.status.success() {
-                Err(Error::NoContainerCommandExecutionFailed)?
-            }
+            // if !output.status.success() {
+            //     Err(Error::NoContainerCommandExecutionFailed)?
+            // }
         }
         Ok(())
     }
