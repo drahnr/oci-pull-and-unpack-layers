@@ -1,8 +1,5 @@
 use super::*;
 
-/// The concrete result type wrapping this crates error type.
-pub type Result<T> = std::result::Result<T, Error>;
-
 // TODO: split it up
 #[allow(missing_docs)]
 #[fatality::fatality(splitable)]

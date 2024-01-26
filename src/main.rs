@@ -1,22 +1,19 @@
-mod util;
-
 mod errors;
+use color_eyre::eyre::WrapErr;
 use color_eyre::owo_colors::OwoColorize;
-use errors::*;
+
 use fs_err as fs;
 use libcontainer::{
     container::builder::ContainerBuilder, syscall::syscall::SyscallType,
     workload::default::DefaultExecutor,
 };
-use color_eyre::eyre::ContextCompat;
-use color_eyre::eyre::WrapErr;
 
 use oci_distribution::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
     IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
 };
 use oci_spec::runtime::{
-    Linux, LinuxCapabilities, LinuxIdMapping, LinuxIdMappingBuilder, Mount, MountBuilder, RootBuilder, Spec
+    Linux, LinuxCapabilities, LinuxIdMappingBuilder, MountBuilder, RootBuilder, Spec,
 };
 use std::{
     collections::VecDeque,
@@ -26,66 +23,10 @@ use std::{
 };
 
 const LOG_TARGET: &str = "foo";
-use std::str::FromStr;
 
 use std::io::{Read, Write};
 
-/// Representation of an image reference
-///
-/// Can either be the registry uri `$registryurl/$user/$container`
-/// or a sha (all lowercase) with 64 characters `a989a...df93e` (no ellipsis).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ImageId {
-    /// A SHA256 identifier for an image.
-    Sha256(String),
-    /// A URI identifier for an image.
-    Uri(String),
-}
-
-impl ImageId {
-    pub(crate) fn as_str(&self) -> &str {
-        match self {
-            Self::Sha256(s) => s.as_str(),
-            Self::Uri(s) => s.as_str(),
-        }
-    }
-}
-
-impl FromStr for ImageId {
-    type Err = Error;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        use once_cell::sync::Lazy;
-        use regex::Regex;
-
-        static RE_SHA256: Lazy<Regex> =
-            Lazy::new(|| Regex::new(r"^\s*([a-z0-9]{64})\s*$").unwrap());
-        static RE_URI: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"^\s*(?P<all>(?P<registry>[A-Za-z0-9_-]+\..{1,12})/(?P<user>[A-Za-z0-9_-]+)/(?P<image>[A-Za-z0-9_-]+)(?P<tag>:[A-Za-z0-9_-]+))\s*$").unwrap()
-        });
-
-        let s: &str = s.trim();
-        let ec = || Error::IncompleteImageId {
-            wannabe_id: s.to_owned(),
-        };
-        if let Some(captures) = RE_SHA256.captures(s) {
-            Ok(Self::Sha256(
-                captures.get(1).ok_or_else(ec)?.as_str().to_string(),
-            ))
-        } else if let Some(captures) = RE_URI.captures(s) {
-            let _registry = captures.name("registry").ok_or_else(ec)?;
-            let _name = captures.name("user").ok_or_else(ec)?;
-            let _image = captures.name("image").ok_or_else(ec)?;
-            let _tag = captures.name("tag").ok_or_else(ec)?;
-            let all = captures.name("all").ok_or_else(ec)?;
-            Ok(Self::Uri(all.as_str().to_string()))
-        } else {
-            Err(Error::IncompleteImageId {
-                wannabe_id: s.to_owned(),
-            })
-        }
-    }
-}
-
+// We can't use the `Archive::unpack`, symlinks and hardlinks aren't unpacked correctly as it appears :shrug:
 fn unpack<T: std::io::Read + std::io::Seek>(
     mut arch: tar::Archive<T>,
     blob_src: &std::path::Path,
@@ -118,7 +59,7 @@ fn unpack<T: std::io::Read + std::io::Seek>(
         let path = path.as_ref();
         gum::trace!(target: LOG_TARGET, "Attempting to create parent dir {}", path.display());
 
-        if let Err(e) = fs_err::create_dir_all(&path) {
+        if let Err(e) = fs_err::create_dir_all(path) {
             if e.kind() != std::io::ErrorKind::AlreadyExists {
                 gum::error!(target: LOG_TARGET, "Failed to create parent dir {}: {:?}", path.display(), e);
                 Err(e)?
@@ -177,7 +118,6 @@ fn unpack<T: std::io::Read + std::io::Seek>(
                     gum::debug!(target: LOG_TARGET, "original: {} link file to be created: {}", in_tar_original.display(), in_tar_link.display());
                     gum::error!(target: LOG_TARGET, "Contains self targeted link {}.", link.display().blue());
                     panic!("Should never happen");
-                
                 }
                 if et == tar::EntryType::Symlink {
                     gum::debug!(target: LOG_TARGET, "Creating symbolic link at {link} pointing to {orig}", link=link.display(), orig=original.display());
@@ -302,33 +242,7 @@ fn chown(path: &std::path::Path, uid: u64, gid: u64) -> std::io::Result<()> {
 }
 
 fn chmod(path: &std::path::Path, perms: std::fs::Permissions) -> std::io::Result<()> {
-    fs_err::set_permissions(&path, perms)
-}
-
-fn unpack_akv(
-    arch: &mut akv::reader::ArchiveReader<'_>,
-    blob_src: &std::path::Path,
-    unpack_dest: &std::path::Path,
-) -> std::io::Result<()> {
-    gum::warn!(target: LOG_TARGET, "Unpacking (akv) layer {} to: {}", blob_src.display(), unpack_dest.display());
-
-    while let Some(entry) = arch.next_entry()? {
-        let in_tar_relative_path = entry.pathname_utf8()?;
-        let unpack_file_dest = unpack_dest.join(in_tar_relative_path);
-        gum::trace!(target: LOG_TARGET, "Unpacking {} to {}", in_tar_relative_path, unpack_file_dest.display());
-        let mut entry_reader = entry.into_reader();
-        if let Ok(mut dest_f) = fs_err::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&unpack_file_dest)
-        {
-            std::io::copy(&mut entry_reader, &mut dest_f)?;
-        } else {
-            gum::warn!(target: LOG_TARGET, "Failed to write to {}", unpack_file_dest.display());
-        }
-    }
-    Ok(())
+    fs_err::set_permissions(path, perms)
 }
 
 use nix::{
@@ -391,10 +305,8 @@ fn handle_foreground(init_pid: Pid) -> color_eyre::eyre::Result<i32> {
             signal => {
                 gum::trace!("forwarding signal");
                 // There is nothing we can do if we fail to forward the signal.
-                let _ = kill(init_pid, Some(signal)).map_err(|err| {
-                    gum::warn!(
-                        "failed to forward signal to container init process",
-                    );
+                let _ = kill(init_pid, Some(signal)).map_err(|_err| {
+                    gum::warn!("failed to forward signal to container init process",);
                 });
             }
         }
@@ -526,8 +438,6 @@ impl Houdini {
                 IMAGE_LAYER_MEDIA_TYPE | IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE => {
                     let arch = tar::Archive::new(&mut blob);
                     unpack(arch, &layer_blob_path, &unpack_dest)?;
-                    // let mut arch = akv::reader::ArchiveReader::open_io(&mut blob)?;
-                    // unpack_akv(&mut arch, &layer_blob_path,  &unpack_dest)?;
                 }
                 IMAGE_LAYER_GZIP_MEDIA_TYPE | IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE => {
                     let mut gzdecoder = flate2::read::GzDecoder::new(&mut blob);
@@ -535,11 +445,8 @@ impl Houdini {
                         tempfile::tempfile_in(layer_blob_path.parent().unwrap())?;
                     std::io::copy(&mut gzdecoder, &mut decompressed)?;
                     decompressed.seek(std::io::SeekFrom::Start(0))?;
-                    // `tar-rs` fails with hardlinks and some permissions, `libarchive` works just fine.
                     let arch = tar::Archive::new(decompressed);
                     unpack(arch, &layer_blob_path, &unpack_dest)?;
-                    // let mut arch = akv::reader::ArchiveReader::open_io(&mut decompressed)?;
-                    // unpack_akv(&mut arch, &layer_blob_path, &unpack_dest)?;
                 }
                 _ => {
                     todo!()
@@ -577,7 +484,7 @@ impl Houdini {
             // .effective(Capability::SysAdmin).build()?;
 
             let mut spec = Spec::default(); // load(self.manifest_store_dir().join("config.json"))?;
-            let mut linux = Linux::rootless(1000, 1000);
+            let linux = Linux::rootless(1000, 1000);
 
             // linux.set_rootfs_propagation(Some("shared".to_owned()));
 
@@ -588,9 +495,7 @@ impl Houdini {
                 ]))
                 .set_cwd(PathBuf::from("/"))
                 .set_args(Some(Vec::from_iter(
-                    ["ls", "-al"]
-                        .into_iter()
-                        .map(|x| x.to_owned()),
+                    ["ls", "-al"].into_iter().map(|x| x.to_owned()),
                 )))
                 .set_capabilities(Some(caps))
                 .set_no_new_privileges(Some(true))
@@ -603,12 +508,17 @@ impl Houdini {
                 .build()?;
             // mAbye fuck here?
             // Stan: will fail on some machines due to different host uid/gid mappings, only if the host uid mapping is a superset of this one it'll work
-            let mut lidmap = LinuxIdMappingBuilder::default()
+            let lidmap = LinuxIdMappingBuilder::default()
                 .host_id(1000_u32)
                 .container_id(0_u32)
                 .size(1_u32)
                 .build()?;
-            let mount = MountBuilder::default().destination("/lib64").typ("bind".to_owned()).source("/usr/lib64").build().unwrap();
+            let _mount = MountBuilder::default()
+                .destination("/lib64")
+                .typ("bind".to_owned())
+                .source("/usr/lib64")
+                .build()
+                .unwrap();
             spec.set_linux(Some(linux))
                 .set_mounts(Some(vec![]))
                 .set_hostname("trapped".to_owned().into())
@@ -696,23 +606,5 @@ async fn main() -> color_eyre::eyre::Result<()> {
     let _quay = "quay.io/drahnr/rust-glibc-builder";
     let _busybox = "docker.io/library/busybox:latest";
     houdini.run(fedora).await?;
-    Ok(())
-}
-
-/// Unified parsing of the process output streams.
-///
-/// Log both `stdout` and `stderr` while adding line numbers to each.
-fn log_command_output(
-    output: &std::process::Output,
-) -> std::result::Result<(), std::str::Utf8Error> {
-    gum::info!(target: LOG_TARGET, "Output status = {:?}", output.status);
-    std::str::from_utf8(&output.stdout)?
-        .split('\n')
-        .enumerate()
-        .for_each(|(_, line)| gum::info!(target: LOG_TARGET, "stdout: {}", line));
-    std::str::from_utf8(&output.stderr)?
-        .split('\n')
-        .enumerate()
-        .for_each(|(_, line)| gum::info!(target: LOG_TARGET, "stderr: {}", line));
     Ok(())
 }
